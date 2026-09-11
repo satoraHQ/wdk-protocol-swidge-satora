@@ -13,18 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end Lightning -> EVM swidge example, using a Spark wallet. MOVES REAL
-// FUNDS.
+// End-to-end Lightning -> EVM swidge example, using a WDK Spark wallet. MOVES
+// REAL FUNDS.
 //
-// It builds a Spark wallet from a persistent BIP-39 seed and wraps it as the
-// Lightning source account (it can pay a BOLT11 invoice). SatoraProtocol
-// creates the swap, the Spark wallet pays the returned invoice, and the EVM
-// tokens are claimed to your recipient address.
+// It derives a WDK Spark wallet account (@tetherto/wdk-wallet-spark) from a
+// persistent BIP-39 seed and hands it to SatoraProtocol as the Lightning
+// source. SatoraProtocol creates the swap, the account pays the returned
+// BOLT11 invoice, and the EVM tokens are claimed to your recipient address.
+// The account also provides the swap client's key material.
 //
 // Requires a FUNDED Spark wallet (Lightning-spendable sats). Configure via the
 // shared examples/.env (see examples/.env.example), loaded with --env-file:
 //
-//   SATORA_MNEMONIC="twelve word seed phrase ..."   # persistent seed (shared)
+//   SATORA_MNEMONIC="twelve word seed phrase ..."   # the wallet seed (shared)
 //   SATORA_SPARK_MAX_FEE_SATS=100                     # max Lightning routing fee (optional)
 //   SATORA_DB, SATORA_BASE_URL, SATORA_ARKADE_SERVER, SATORA_ESPLORA  # optional
 //
@@ -34,13 +35,12 @@
 //   node --env-file=examples/.env examples/satora-cli-spark.js invoice --amount 1000
 //   node --env-file=examples/.env examples/satora-cli-spark.js pay --invoice lnbc...
 //   node --env-file=examples/.env examples/satora-cli-spark.js swap \
-//     --to 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
-//     --recipient 0xYourEvmAddress \
-//     --amount 5000
+//     --to 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 --to-chain 42161 \
+//     --recipient 0xYourEvmAddress --amount 5000
 
 import { validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english.js'
-import { SparkWallet } from '@buildonspark/spark-sdk'
+import WalletManagerSpark from '@tetherto/wdk-wallet-spark'
 
 import SatoraProtocol from '../index.js'
 
@@ -76,36 +76,19 @@ async function createStorage (dbPath) {
   }
 }
 
-// Builds a Spark wallet and adapts it to the Lightning source account surface
-// swidge needs: payInvoice(bolt11). Also exposes helpers for the CLI commands.
+const maxFeeSats = () => Number(process.env.SATORA_SPARK_MAX_FEE_SATS || 100)
+
+// Derives the WDK Spark wallet account (index 0).
 async function buildSparkAccount (mnemonic) {
-  const { wallet } = await SparkWallet.initialize({
-    mnemonicOrSeed: mnemonic,
-    options: { network: 'MAINNET' }
-  })
-
-  const maxFeeSats = Number(process.env.SATORA_SPARK_MAX_FEE_SATS || 100)
-
-  return {
-    getSparkAddress: () => wallet.getSparkAddress(),
-    async getBalance () {
-      const { satsBalance } = await wallet.getBalance()
-      return satsBalance.available
-    },
-    async createInvoice (amountSats, memo) {
-      const request = await wallet.createLightningInvoice({ amountSats, memo })
-      return request.invoice.encodedInvoice
-    },
-    // The swidge funding step: pay the swap's BOLT11 invoice.
-    payInvoice: (invoice) => wallet.payLightningInvoice({ invoice, maxFeeSats })
-  }
+  const manager = new WalletManagerSpark(mnemonic, { network: 'MAINNET' })
+  return manager.getAccount(0)
 }
 
-async function createProtocol (account, { mnemonic, dbPath }) {
+async function createProtocol (account, { dbPath }) {
   const { signerStorage, swapStorage } = await createStorage(dbPath)
   return new SatoraProtocol(account, {
-    mnemonic,
-    accountChains: ['Lightning'],
+    // The source chain (Lightning) is detected from the account.
+    lightningMaxFeeSats: maxFeeSats(),
     arkadeServerUrl: process.env.SATORA_ARKADE_SERVER || 'https://arkade.computer',
     esploraUrl: process.env.SATORA_ESPLORA || 'https://mempool.space/api',
     ...(process.env.SATORA_BASE_URL ? { baseUrl: process.env.SATORA_BASE_URL } : {}),
@@ -123,18 +106,19 @@ function printResult (result) {
 }
 
 function usage () {
-  console.log(`satora-cli-spark — Lightning -> EVM swidge example (Spark wallet)
+  console.log(`satora-cli-spark — Lightning -> EVM swidge example (WDK Spark wallet)
 
 Usage:
   node --env-file=examples/.env examples/satora-cli-spark.js <command> [options]
 
 Commands:
   address              Show the Spark address
-  balance              Show the spendable Lightning balance (sats)
+  balance              Show the spendable balance (sats)
   invoice --amount <n> Create a Lightning invoice for <n> sats (--memo optional)
   pay --invoice <b11>  Pay a BOLT11 Lightning invoice
   swap                 Perform a Lightning -> EVM swap:
-                         --to <chain:token>      destination token (e.g. 42161:0xfd08...)
+                         --to <address>          destination ERC-20 contract address (e.g. 0xfd08...)
+                         --to-chain <id>         destination EVM chain (default 42161)
                          --recipient <address>   EVM address to receive the tokens
                          --amount <sats>         amount to send, in sats
   status <swap-id>     Show the status of a swap by id
@@ -160,30 +144,22 @@ async function main () {
 
   const dbPath = process.env.SATORA_DB || './.satora.db'
 
-  // status/resume are read-only of the Spark wallet — no wallet needed.
-  if (command === 'status' || command === 'resume') {
+  // status is read-only — no wallet needed.
+  if (command === 'status') {
     const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
     if (!swapId) {
-      console.error(`${command} requires a swap id: ${command} <swap-id>`)
+      console.error('status requires a swap id: status <swap-id>')
       process.exit(1)
     }
-
-    const protocol = await createProtocol(undefined, { mnemonic, dbPath })
-    if (command === 'status') {
-      printResult(await protocol.getSwidgeStatus(swapId))
-    } else {
-      console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
-      printResult(await protocol.resumeSwidge(swapId))
-    }
-
+    const protocol = await createProtocol(undefined, { dbPath })
+    printResult(await protocol.getSwidgeStatus(swapId))
     process.exit(0)
   }
 
   const account = await buildSparkAccount(mnemonic)
 
   if (command === 'address') {
-    console.log('Spark address:', await account.getSparkAddress())
-    console.log('LNURL:         not exposed by the Spark SDK (receive via `invoice` or the Spark address)')
+    console.log('Spark address:', await account.getAddress())
     process.exit(0)
   }
 
@@ -197,8 +173,11 @@ async function main () {
       console.error('invoice requires: --amount <sats> [--memo <text>]')
       process.exit(1)
     }
-    const invoice = await account.createInvoice(Number(flags.amount), typeof flags.memo === 'string' ? flags.memo : undefined)
-    console.log(invoice)
+    const request = await account.createLightningInvoice({
+      amountSats: Number(flags.amount),
+      ...(typeof flags.memo === 'string' ? { memo: flags.memo } : {})
+    })
+    console.log(request.invoice.encodedInvoice)
     process.exit(0)
   }
 
@@ -208,8 +187,20 @@ async function main () {
       process.exit(1)
     }
     console.log(`Paying invoice ${flags.invoice.slice(0, 30)}... `)
-    const result = await account.payInvoice(flags.invoice)
+    const result = await account.payLightningInvoice({ invoice: flags.invoice, maxFeeSats: maxFeeSats() })
     console.log('Paid. status:', result.status ?? 'submitted')
+    process.exit(0)
+  }
+
+  if (command === 'resume') {
+    const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
+    if (!swapId) {
+      console.error('resume requires a swap id: resume <swap-id>')
+      process.exit(1)
+    }
+    const protocol = await createProtocol(account, { dbPath })
+    console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
+    printResult(await protocol.resumeSwidge(swapId))
     process.exit(0)
   }
 
@@ -220,19 +211,21 @@ async function main () {
   }
 
   if (!flags.to || !flags.recipient || flags.amount === undefined || flags.amount === true) {
-    console.error('swap requires: --to <chain:token> --recipient <evm-address> --amount <sats>')
+    console.error('swap requires: --to <token-address> [--to-chain <id>] --recipient <evm-address> --amount <sats>')
     process.exit(1)
   }
 
-  const protocol = await createProtocol(account, { mnemonic, dbPath })
+  const toChain = Number(flags['to-chain'] || 42161)
+  const protocol = await createProtocol(account, { dbPath })
 
-  console.log('Spark address:', await account.getSparkAddress())
-  console.log(`\nSwapping ${flags.amount} sats (Lightning) -> ${flags.to} for ${flags.recipient} ...`)
+  console.log('Spark address:', await account.getAddress())
+  console.log(`\nSwapping ${flags.amount} sats (Lightning) -> ${flags.to} on ${toChain} for ${flags.recipient} ...`)
   console.log('(pays the swap invoice, then drives the whole flow — it can take a little while)\n')
 
   const result = await protocol.swidge({
-    fromToken: 'Lightning:btc',
+    fromToken: 'btc',
     toToken: flags.to,
+    toChain,
     fromTokenAmount: BigInt(flags.amount),
     recipient: flags.recipient
   })
@@ -240,7 +233,7 @@ async function main () {
   console.log('Done:')
   console.log('  swap id: ', result.id)
   console.log('  spent:   ', result.fromTokenAmount, 'sats')
-  console.log('  received:', result.toTokenAmount, `(${flags.to})`)
+  console.log('  received:', result.toTokenAmount, `(${flags.to} on ${toChain}, base units)`)
   for (const tx of result.transactions) console.log(`  ${tx.type} tx (${tx.chain}): ${tx.hash}`)
 }
 

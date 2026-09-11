@@ -13,60 +13,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// End-to-end EVM -> Arkade swidge example. This MOVES REAL FUNDS.
+// End-to-end EVM -> Arkade / Bitcoin / Lightning swidge example. This MOVES
+// REAL FUNDS.
 //
-// It builds an EVM wallet from a persistent BIP-39 seed (viem), wraps it as the
-// SDK's EvmSigner, and runs a real EVM -> Arkade swap via SatoraProtocol. The
-// account funds the EVM HTLC (token approval + deposit, so it needs some native
-// gas), and the BTC is claimed to your Arkade recipient address.
+// It derives a WDK EVM wallet account (@tetherto/wdk-wallet-evm) from a
+// persistent BIP-39 seed and hands it to SatoraProtocol. The account is the
+// source: it signs the Permit2 funding, sends the HTLC deposit (so it needs a
+// little native gas), and also provides the swap client's key material — no
+// separate secret. The source chain is read from the account's provider.
 //
-// Requires a FUNDED EVM wallet (source token + a little gas). Configure via the
-// shared examples/.env (see examples/.env.example), loaded with --env-file:
+// Configure via the shared examples/.env (see examples/.env.example), loaded
+// with --env-file:
 //
-//   SATORA_MNEMONIC="twelve word seed phrase ..."   # persistent seed (shared)
+//   SATORA_MNEMONIC="twelve word seed phrase ..."   # the wallet seed (shared by all examples)
 //   SATORA_EVM_RPC=https://arb1.arbitrum.io/rpc      # RPC for the source chain (optional)
 //   SATORA_ARKADE_SERVER, SATORA_ESPLORA, SATORA_DB, SATORA_BASE_URL  # optional
 //
 // Usage:
 //   node --env-file=examples/.env examples/satora-cli-evm.js address
-//   # EVM -> Arkade
+//   node --env-file=examples/.env examples/satora-cli-evm.js balance
+//   # EVM -> Arkade (default destination)
 //   node --env-file=examples/.env examples/satora-cli-evm.js swap \
-//     --from 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
-//     --recipient ark1q... \
-//     --amount 1.5
+//     --from 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 --recipient ark1q... --amount 1.5
 //   # EVM -> Bitcoin (on-chain; recipient is a BTC address)
 //   node --env-file=examples/.env examples/satora-cli-evm.js swap \
-//     --from 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
-//     --to Bitcoin:btc --recipient bc1q... --amount 1.5 --fee-rate 5
+//     --from 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
+//     --to-chain Bitcoin --recipient bc1q... --amount 1.5 --fee-rate 5
 //   # EVM -> Lightning (recipient is a BOLT11 invoice, e.g. from satora-cli-spark.js invoice)
 //   node --env-file=examples/.env examples/satora-cli-evm.js swap \
-//     --from 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
-//     --to Lightning:btc --recipient lnbc...
+//     --from 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 --to-chain Lightning --recipient lnbc...
 //   node --env-file=examples/.env examples/satora-cli-evm.js status <swap-id>
 //   node --env-file=examples/.env examples/satora-cli-evm.js resume <swap-id>
 
-import { HDKey } from '@scure/bip32'
-import { mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
+import { validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english.js'
-import { createPublicClient, createWalletClient, formatUnits, http, parseAbi } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
-import { arbitrum, mainnet, polygon } from 'viem/chains'
+import WalletManagerEvm from '@tetherto/wdk-wallet-evm'
 
 import SatoraProtocol from '../index.js'
 
-// BIP-44 EVM account path (index 0).
-const EVM_DERIVATION_PATH = "m/44'/60'/0'/0/0"
-
-const CHAINS = { 1: mainnet, 137: polygon, 42161: arbitrum }
+// Public RPC per chain, used unless SATORA_EVM_RPC is set.
+const DEFAULT_RPC = {
+  1: 'https://ethereum-rpc.publicnode.com',
+  137: 'https://polygon-bor-rpc.publicnode.com',
+  42161: 'https://arb1.arbitrum.io/rpc'
+}
 
 // USDT0 token address per chain, for the `balance` command.
 const USDT0_BY_CHAIN = { 42161: '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9' }
-
-const ERC20_ABI = parseAbi([
-  'function balanceOf(address) view returns (uint256)',
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)'
-])
 
 function parseArgs (argv) {
   const flags = {}
@@ -93,6 +86,14 @@ function parseUnits (value, decimals) {
   return BigInt(`${whole || '0'}${fraction.padEnd(decimals, '0')}`)
 }
 
+// Formats a base-unit bigint as a decimal string.
+function formatUnits (amount, decimals) {
+  const base = 10n ** BigInt(decimals)
+  const whole = (BigInt(amount) / base).toString()
+  const fraction = (BigInt(amount) % base).toString().padStart(decimals, '0').replace(/0+$/, '')
+  return fraction ? `${whole}.${fraction}` : whole
+}
+
 // Persistent SQLite storage; fail loudly if unavailable (see satora-cli-arkade.js).
 async function createStorage (dbPath) {
   try {
@@ -107,51 +108,21 @@ async function createStorage (dbPath) {
   }
 }
 
-// Wraps a viem wallet/public client into the SDK's EvmSigner interface.
-function buildEvmSigner (walletClient, publicClient) {
-  return {
-    address: walletClient.account.address,
-    chainId: walletClient.chain.id,
-    signTypedData: (td) => walletClient.signTypedData({ ...td, account: walletClient.account }),
-    sendTransaction: (tx) => walletClient.sendTransaction({ to: tx.to, data: tx.data, chain: walletClient.chain, gas: tx.gas }),
-    waitForReceipt: async (hash) => {
-      const r = await publicClient.waitForTransactionReceipt({ hash })
-      return { status: r.status, blockNumber: r.blockNumber, transactionHash: r.transactionHash }
-    },
-    getTransaction: async (hash) => {
-      const t = await publicClient.getTransaction({ hash })
-      return { to: t.to ?? null, input: t.input, from: t.from }
-    },
-    call: async (tx) => {
-      const r = await publicClient.call({ to: tx.to, data: tx.data, account: tx.from, blockNumber: tx.blockNumber })
-      return r.data ?? '0x'
-    }
-  }
+// Derives the WDK EVM wallet account (index 0) for the given chain.
+async function buildEvmAccount (mnemonic, chainId) {
+  const provider = process.env.SATORA_EVM_RPC || DEFAULT_RPC[chainId]
+  if (!provider) throw new Error(`no RPC known for chain ${chainId}; set SATORA_EVM_RPC`)
+
+  const manager = new WalletManagerEvm(mnemonic, { provider, chainId })
+  return manager.getAccount(0)
 }
 
-// Builds an EvmSigner for the given chain from the seed.
-function buildEvmAccount (mnemonic, chainId) {
-  const chain = CHAINS[chainId]
-  if (!chain) throw new Error(`unsupported EVM chain ${chainId} (supported: ${Object.keys(CHAINS).join(', ')})`)
-
-  const node = HDKey.fromMasterSeed(mnemonicToSeedSync(mnemonic, '')).derive(EVM_DERIVATION_PATH)
-  if (!node.privateKey) throw new Error('failed to derive the EVM key from the seed')
-
-  const account = privateKeyToAccount(`0x${Buffer.from(node.privateKey).toString('hex')}`)
-  const transport = process.env.SATORA_EVM_RPC ? http(process.env.SATORA_EVM_RPC) : http()
-  const walletClient = createWalletClient({ account, chain, transport })
-  const publicClient = createPublicClient({ chain, transport })
-
-  return { signer: buildEvmSigner(walletClient, publicClient), publicClient, chain }
-}
-
-async function createProtocol (account, { mnemonic, chainId, dbPath, feeRateSatPerVb }) {
+async function createProtocol (account, { dbPath, feeRateSatPerVb }) {
   const { signerStorage, swapStorage } = await createStorage(dbPath)
   return new SatoraProtocol(account, {
-    mnemonic,
+    // The source chain is detected from the account's provider.
     arkadeServerUrl: process.env.SATORA_ARKADE_SERVER || 'https://arkade.computer',
     esploraUrl: process.env.SATORA_ESPLORA || 'https://mempool.space/api',
-    ...(chainId ? { accountChains: [chainId] } : {}),
     ...(feeRateSatPerVb ? { feeRateSatPerVb } : {}),
     ...(process.env.SATORA_BASE_URL ? { baseUrl: process.env.SATORA_BASE_URL } : {}),
     signerStorage,
@@ -168,7 +139,7 @@ function printResult (result) {
 }
 
 function usage () {
-  console.log(`satora-cli-evm — EVM -> Arkade swidge example
+  console.log(`satora-cli-evm — EVM -> Arkade / Bitcoin / Lightning swidge example (WDK EVM wallet)
 
 Usage:
   node --env-file=examples/.env examples/satora-cli-evm.js <command> [options]
@@ -177,10 +148,12 @@ Commands:
   address           Show the EVM wallet address (--chain <id>, default 42161)
   balance           Show native + USDT0 balance (--chain <id>, --token <address>)
   swap              Perform an EVM -> Arkade / Bitcoin / Lightning swap:
-                      --from <chain:token>    EVM source token (e.g. 42161:0xfd08...)
-                      --to <chain:token>      destination (default Arkade:btc; Bitcoin:btc; Lightning:btc)
+                      --from <address>        source ERC-20 contract address on the account's chain
+                      --chain <id>            source EVM chain (default 42161)
+                      --to-chain <chain>      Arkade (default), Bitcoin, or Lightning
                       --recipient <address>   Arkade/Bitcoin address, or a BOLT11 invoice for Lightning
                       --amount <units>        source-token units (Arkade/Bitcoin; Lightning uses the invoice)
+                      --slippage <decimal>    max slippage vs the quote (default 0.01); sets minAmountOut
                       --fee-rate <sat/vB>     on-chain Bitcoin claim fee rate (Bitcoin only; or SATORA_BTC_FEE_RATE)
   status <swap-id>  Show the status of a swap by id
   resume <swap-id>  Drive an interrupted swap to completion (throws if it cannot)
@@ -208,77 +181,64 @@ async function main () {
   }
 
   const dbPath = process.env.SATORA_DB || './.satora.db'
+  const chainId = Number(flags.chain || 42161)
   const feeRateSatPerVb = flags['fee-rate'] !== undefined && flags['fee-rate'] !== true
     ? Number(flags['fee-rate'])
     : (process.env.SATORA_BTC_FEE_RATE ? Number(process.env.SATORA_BTC_FEE_RATE) : undefined)
 
-  // status/resume are read-only of the wallet — no EVM signer needed.
-  if (command === 'status' || command === 'resume') {
+  // status is read-only — no account needed.
+  if (command === 'status') {
     const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
     if (!swapId) {
-      console.error(`${command} requires a swap id: ${command} <swap-id>`)
+      console.error('status requires a swap id: status <swap-id>')
       process.exit(1)
     }
-
-    const protocol = await createProtocol(undefined, { mnemonic, dbPath, feeRateSatPerVb })
-    if (command === 'status') {
-      printResult(await protocol.getSwidgeStatus(swapId))
-    } else {
-      console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
-      printResult(await protocol.resumeSwidge(swapId))
-    }
-
+    const protocol = await createProtocol(undefined, { dbPath, feeRateSatPerVb })
+    printResult(await protocol.getSwidgeStatus(swapId))
     process.exit(0)
   }
 
+  const account = await buildEvmAccount(mnemonic, chainId)
+  const address = await account.getAddress()
+
   if (command === 'address') {
-    const chainId = Number(flags.chain || 42161)
-    const { signer } = buildEvmAccount(mnemonic, chainId)
-    console.log('EVM wallet:', signer.address, `(chain ${chainId})`)
+    console.log('EVM wallet:', address, `(chain ${chainId})`)
     process.exit(0)
   }
 
   if (command === 'balance') {
-    const chainId = Number(flags.chain || 42161)
-    const { signer, publicClient, chain } = buildEvmAccount(mnemonic, chainId)
     const tokenAddress = flags.token || USDT0_BY_CHAIN[chainId]
-
-    console.log('EVM wallet:', signer.address, `(chain ${chainId})`)
-
-    const native = await publicClient.getBalance({ address: signer.address })
-    console.log(`  native: ${formatUnits(native, chain.nativeCurrency.decimals)} ${chain.nativeCurrency.symbol}`)
+    console.log('EVM wallet:', address, `(chain ${chainId})`)
+    console.log(`  native: ${formatUnits(await account.getBalance(), 18)}`)
 
     if (tokenAddress) {
-      const contract = { address: tokenAddress, abi: ERC20_ABI }
-      const [bal, decimals, symbol] = await Promise.all([
-        publicClient.readContract({ ...contract, functionName: 'balanceOf', args: [signer.address] }),
-        publicClient.readContract({ ...contract, functionName: 'decimals' }),
-        publicClient.readContract({ ...contract, functionName: 'symbol' })
-      ])
-      console.log(`  ${symbol}: ${formatUnits(bal, decimals)} (${tokenAddress})`)
+      const protocol = await createProtocol(account, { dbPath })
+      const info = (await protocol.getSupportedTokens({ fromChain: chainId }))
+        .find(t => t.token.toLowerCase() === tokenAddress.toLowerCase())
+      const balance = await account.getTokenBalance(tokenAddress)
+      console.log(`  ${info?.symbol ?? 'token'}: ${info ? formatUnits(balance, info.decimals) : `${balance} (base units)`} (${tokenAddress})`)
     } else {
       console.log(`  (no USDT0 known for chain ${chainId}; pass --token <address>)`)
     }
-
     process.exit(0)
   }
 
-  if (command === 'refund') {
+  // resume/refund reuse the account: the swap key is derived from it.
+  if (command === 'resume' || command === 'refund') {
     const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
     if (!swapId) {
-      console.error('refund requires a swap id: refund <swap-id> [--chain <id>] [--manual]')
+      console.error(`${command} requires a swap id: ${command} <swap-id> [--chain <id>]`)
       process.exit(1)
     }
+    const protocol = await createProtocol(account, { dbPath, feeRateSatPerVb })
 
-    const chainId = Number(flags.chain || 42161)
-    const { signer } = buildEvmAccount(mnemonic, chainId)
-    const protocol = await createProtocol(signer, { mnemonic, chainId, dbPath, feeRateSatPerVb })
-
-    console.log(`Refunding swap ${swapId} to ${signer.address} ...`)
-    printResult(await protocol.refundSwidge(swapId, {
-      ...(flags.manual ? { manual: true } : {})
-    }))
-
+    if (command === 'resume') {
+      console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
+      printResult(await protocol.resumeSwidge(swapId))
+    } else {
+      console.log(`Refunding swap ${swapId} to ${address} ...`)
+      printResult(await protocol.refundSwidge(swapId, { ...(flags.manual ? { manual: true } : {}) }))
+    }
     process.exit(0)
   }
 
@@ -289,22 +249,20 @@ async function main () {
   }
 
   if (!flags.from || !flags.recipient) {
-    console.error('swap requires: --from <chain:token> --recipient <address|invoice> [--to <chain:token>] [--amount <units>]')
+    console.error('swap requires: --from <token-address> --recipient <address|invoice> [--to-chain <chain>] [--amount <units>]')
     process.exit(1)
   }
 
-  const toToken = flags.to || 'Arkade:btc'
-  const toLightning = toToken.startsWith('Lightning')
+  const toChain = flags['to-chain'] || 'Arkade'
+  const toLightning = String(toChain).toLowerCase() === 'lightning'
+  const protocol = await createProtocol(account, { dbPath, feeRateSatPerVb })
 
-  const chainId = Number(flags.from.split(':')[0])
-  const { signer } = buildEvmAccount(mnemonic, chainId)
-  const protocol = await createProtocol(signer, { mnemonic, chainId, dbPath, feeRateSatPerVb })
-
-  const info = (await protocol.getSupportedTokens()).find(t => t.token.toLowerCase() === flags.from.toLowerCase())
-  if (!info) throw new Error(`unknown token ${flags.from} — run: node examples/satora-cli.js tokens`)
+  const info = (await protocol.getSupportedTokens({ fromChain: chainId }))
+    .find(t => t.token.toLowerCase() === flags.from.toLowerCase())
+  if (!info) throw new Error(`unknown token ${flags.from} on chain ${chainId} — run: node examples/satora-cli.js tokens --from-chain ${chainId}`)
 
   // Use the canonical token id (normalises the address case).
-  const swapOptions = { fromToken: info.token, toToken, recipient: flags.recipient }
+  const swapOptions = { fromToken: info.token, toToken: 'btc', toChain, recipient: flags.recipient }
   if (toLightning) {
     // EVM -> Lightning: the recipient is a BOLT11 invoice that carries the amount.
     if (!flags.recipient.toLowerCase().startsWith('ln')) {
@@ -312,23 +270,29 @@ async function main () {
       process.exit(1)
     }
   } else {
-    // EVM -> Arkade: exact-in, amount in source-token units.
+    // EVM -> Arkade / Bitcoin: exact-in, amount in source-token units. Quote
+    // first and pass the accepted minimum as the minAmountOut guard.
     if (flags.amount === undefined || flags.amount === true) {
-      console.error(`swap to ${toToken} requires --amount <${info.symbol} units>`)
+      console.error(`swap to ${toChain} requires --amount <${info.symbol} units>`)
       process.exit(1)
     }
     swapOptions.fromTokenAmount = parseUnits(flags.amount, info.decimals)
+    swapOptions.slippage = Number(flags.slippage || 0.01)
+
+    const quote = await protocol.quoteSwidge(swapOptions)
+    console.log(`Quote: ${formatUnits(quote.fromTokenAmount, info.decimals)} ${info.symbol} -> ${quote.toTokenAmount} sats (min ${quote.toTokenAmountMin})`)
+    swapOptions.minAmountOut = quote.toTokenAmountMin
   }
 
-  console.log('EVM wallet:', signer.address, `(chain ${chainId})`)
-  console.log(`\nSwapping ${flags.amount ?? '(invoice amount)'} ${info.symbol} -> ${toToken} for ${flags.recipient} ...`)
+  console.log('EVM wallet:', address, `(chain ${chainId})`)
+  console.log(`\nSwapping ${flags.amount ?? '(invoice amount)'} ${info.symbol} -> ${toChain} for ${flags.recipient} ...`)
   console.log('(this funds the EVM HTLC, then drives the whole flow — it can take a little while)\n')
 
   const result = await protocol.swidge(swapOptions)
 
   console.log('Done:')
   console.log('  swap id: ', result.id)
-  console.log(`  spent:   ${result.fromTokenAmount} ${info.symbol} (base units)`)
+  console.log(`  spent:   ${formatUnits(result.fromTokenAmount, info.decimals)} ${info.symbol}`)
   console.log('  received:', result.toTokenAmount, 'sats')
   for (const tx of result.transactions) console.log(`  ${tx.type} tx (${tx.chain}): ${tx.hash}`)
 }

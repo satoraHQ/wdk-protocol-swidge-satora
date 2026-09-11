@@ -41,4 +41,4 @@ export type SatoraProtocolConfig = import('./src/satora-protocol.js').SatoraProt
 /** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedTokensOptions} SwidgeSupportedTokensOptions */
 /** @typedef {import('./src/satora-protocol.js').SatoraProtocolConfig} SatoraProtocolConfig */
 export { default } from './src/satora-protocol.js';
-export { SatoraInvalidOptionsError } from './src/errors.js';
+export { SatoraInvalidOptionsError, SatoraMinAmountOutError } from './src/errors.js';

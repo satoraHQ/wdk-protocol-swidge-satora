@@ -29,22 +29,23 @@
     ]
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "@satora/swap": "^1.4.0",
+    "@scure/bip32": "^2.3.0",
     "@tetherto/wdk-wallet": "^1.0.0-beta.14",
     "bare-node-runtime": "^1.5.0"
   },
   "devDependencies": {
     "@arkade-os/sdk": "^0.4.66",
-    "@buildonspark/spark-sdk": "^0.11.0",
-    "@scure/bip32": "^2.3.0",
     "@scure/bip39": "^2.3.0",
-    "@scure/btc-signer": "^2.3.0",
+    "@tetherto/wdk-wallet-btc": "^1.0.0-beta.15",
+    "@tetherto/wdk-wallet-evm": "^1.0.0-beta.18",
+    "@tetherto/wdk-wallet-spark": "^1.0.0-beta.25",
     "cross-env": "^10.1.0",
     "eventsource": "^4.1.0",
     "jest": "^30.5.0",
     "standard": "^17.1.2",
-    "typescript": "^7.0.2",
-    "viem": "^2.56.0"
+    "typescript": "^7.0.2"
   },
   "exports": {
     ".": {

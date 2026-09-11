@@ -20,17 +20,33 @@ export type ClaimOptions = import('@satora/swap').ClaimOptions;
 export type QuoteResponse = import('@satora/swap').QuoteResponse;
 export type SatoraProtocolConfig = {
     /**
+     * - The chain the wallet account operates on, i.e. the swidge **source** chain: an EVM chain id (1, 137, 42161) or 'Bitcoin' | 'Arkade' | 'Lightning'. Detected automatically for WDK EVM accounts (from their provider) and Lightning accounts; required for Bitcoin and Arkade accounts.
+     */
+    chain?: string | number;
+    /**
      * - The default slippage tolerance as a decimal (e.g., 0.01 for 1%).
      */
     defaultSlippage?: number;
     /**
+     * - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
+     */
+    feeRateSatPerVb?: number;
+    /**
+     * - Maximum routing fee (sats) a Lightning account may pay for the swap invoice.
+     */
+    lightningMaxFeeSats?: number;
+    /**
+     * - Persists the swap client's key index. Recommended for fund-moving operations so an interrupted swap survives a restart.
+     */
+    signerStorage?: WalletStorage;
+    /**
+     * - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
+     */
+    swapStorage?: SwapStorage;
+    /**
      * - Override the satora API base URL. Defaults to the SDK's production endpoint.
      */
     baseUrl?: string;
-    /**
-     * - BIP39 mnemonic for the swap client's secret material (HTLC preimage + gasless-claim key). Separate from the funding account. Not required for read-only operations (chains, tokens, quotes).
-     */
-    mnemonic?: string;
     /**
      * - Override the Arkade server URL.
      */
@@ -39,28 +55,30 @@ export type SatoraProtocolConfig = {
      * - Override the Esplora (Bitcoin) API URL.
      */
     esploraUrl?: string;
-    /**
-     * - Persists the seed / key index (the swap client's database). Recommended for fund-moving operations so an interrupted swap survives a restart. Omit for in-memory (not recoverable across restarts).
-     */
-    signerStorage?: WalletStorage;
-    /**
-     * - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
-     */
-    swapStorage?: SwapStorage;
-    /**
-     * - The chains the provided wallet account can fund/operate on (e.g. ['Arkade'] for an Arkade wallet, or [1, 137, 42161] for an EVM wallet). When set, `swidge` validates that the source chain is one of these.
-     */
-    accountChains?: (string | number)[];
-    /**
-     * - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
-     */
-    feeRateSatPerVb?: number;
 };
 export type SatoraRefundOptions = {
     /**
-     * - For an EVM-sourced swap: use the timelock-based refund (user pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+     * - For an EVM-sourced swap: use the timelock-based refund (the account pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
      */
     manual?: boolean;
+};
+export type SwidgeRoute = {
+    /**
+     * - The satora source chain id.
+     */
+    sourceChain: string;
+    /**
+     * - The source token id (`btc` or a contract address).
+     */
+    sourceToken: string;
+    /**
+     * - The satora destination chain id.
+     */
+    targetChain: string;
+    /**
+     * - The destination token id.
+     */
+    targetToken: string;
 };
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccount} IWalletAccount */
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccountReadOnly} IWalletAccountReadOnly */
@@ -83,19 +101,26 @@ export type SatoraRefundOptions = {
 /** @typedef {import('@satora/swap').QuoteResponse} QuoteResponse */
 /**
  * @typedef {Object} SatoraProtocolConfig
+ * @property {string | number} [chain] - The chain the wallet account operates on, i.e. the swidge **source** chain: an EVM chain id (1, 137, 42161) or 'Bitcoin' | 'Arkade' | 'Lightning'. Detected automatically for WDK EVM accounts (from their provider) and Lightning accounts; required for Bitcoin and Arkade accounts.
  * @property {number} [defaultSlippage] - The default slippage tolerance as a decimal (e.g., 0.01 for 1%).
+ * @property {number} [feeRateSatPerVb] - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
+ * @property {number} [lightningMaxFeeSats] - Maximum routing fee (sats) a Lightning account may pay for the swap invoice.
+ * @property {WalletStorage} [signerStorage] - Persists the swap client's key index. Recommended for fund-moving operations so an interrupted swap survives a restart.
+ * @property {SwapStorage} [swapStorage] - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
  * @property {string} [baseUrl] - Override the satora API base URL. Defaults to the SDK's production endpoint.
- * @property {string} [mnemonic] - BIP39 mnemonic for the swap client's secret material (HTLC preimage + gasless-claim key). Separate from the funding account. Not required for read-only operations (chains, tokens, quotes).
  * @property {string} [arkadeServerUrl] - Override the Arkade server URL.
  * @property {string} [esploraUrl] - Override the Esplora (Bitcoin) API URL.
- * @property {WalletStorage} [signerStorage] - Persists the seed / key index (the swap client's database). Recommended for fund-moving operations so an interrupted swap survives a restart. Omit for in-memory (not recoverable across restarts).
- * @property {SwapStorage} [swapStorage] - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
- * @property {(string | number)[]} [accountChains] - The chains the provided wallet account can fund/operate on (e.g. ['Arkade'] for an Arkade wallet, or [1, 137, 42161] for an EVM wallet). When set, `swidge` validates that the source chain is one of these.
- * @property {number} [feeRateSatPerVb] - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
  */
 /**
  * @typedef {Object} SatoraRefundOptions
- * @property {boolean} [manual] - For an EVM-sourced swap: use the timelock-based refund (user pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+ * @property {boolean} [manual] - For an EVM-sourced swap: use the timelock-based refund (the account pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+ */
+/**
+ * @typedef {Object} SwidgeRoute
+ * @property {string} sourceChain - The satora source chain id.
+ * @property {string} sourceToken - The source token id (`btc` or a contract address).
+ * @property {string} targetChain - The satora destination chain id.
+ * @property {string} targetToken - The destination token id.
  */
 export default class SatoraProtocol extends SwidgeProtocol {
     /**
@@ -107,30 +132,88 @@ export default class SatoraProtocol extends SwidgeProtocol {
     _config: SatoraProtocolConfig;
     /** @private */
     _clientPromise;
+    /** @private */
+    _signingClientPromise;
+    /** @private */
+    _evmSignerPromise;
+    /** @private */
+    _detectedChain;
     constructor(account?: undefined, config?: SatoraProtocolConfig);
     constructor(account: IWalletAccountReadOnly, config?: SatoraProtocolConfig);
     constructor(account: IWalletAccount, config?: SatoraProtocolConfig);
     /**
-     * Lazily constructs (and memoizes) the underlying satora swap client.
-     * Read-only operations build a stateless client; a mnemonic is only
-     * required for fund-moving operations.
+     * Lazily constructs (and memoizes) a read-only satora swap client, used for
+     * discovery, quotes and status lookups.
      *
      * @protected
      * @returns {Promise<SatoraClient>} The satora swap client.
      */
     protected _getClient(): Promise<SatoraClient>;
     /**
+     * Lazily constructs (and memoizes) the signing satora swap client, whose key
+     * material (HTLC preimage + claim/refund keys) is derived from the wallet
+     * account. Required by every fund-moving operation.
+     *
+     * @protected
+     * @returns {Promise<SatoraClient>} The satora swap client.
+     * @throws {SatoraInvalidOptionsError} If no account is bound or it cannot derive the swap key.
+     */
+    protected _getSigningClient(): Promise<SatoraClient>;
+    /**
+     * @private
+     * @param {string} [xprv] - The swap client's key material; omitted for a read-only client.
+     * @returns {Promise<SatoraClient>} The satora swap client.
+     */
+    private _buildClient;
+    /**
+     * Resolves the swidge route. The source chain is the account's chain
+     * (`config.chain`, or detected from the account); the destination chain is
+     * `toChain`, defaulting to the source chain. Tokens are bare provider ids
+     * (`btc` or a contract address); a chain-qualified `chain:tokenId` is also
+     * accepted on either side.
+     *
+     * @protected
+     * @param {SwidgeOptions} options - The swidge options.
+     * @returns {Promise<SwidgeRoute>} The route.
+     * @throws {SatoraInvalidOptionsError} If a token is missing or the source chain cannot be determined.
+     */
+    protected _resolveRoute(options: SwidgeOptions): Promise<SwidgeRoute>;
+    /**
+     * @private
+     * @param {string} [qualified] - The chain prefix carried by `fromToken`, if any.
+     * @returns {Promise<string>} The satora source chain id.
+     */
+    private _resolveSourceChain;
+    /**
+     * Detects the account's chain: Lightning accounts pay invoices, EVM accounts
+     * report their chain id through their provider. Bitcoin and Arkade accounts
+     * are indistinguishable and must declare `config.chain`.
+     *
+     * @private
+     * @returns {Promise<string | undefined>} The satora chain id, if detectable.
+     */
+    private _detectAccountChain;
+    /**
+     * Adapts the bound account to the SDK's {@link EvmSigner} (memoized).
+     *
+     * @private
+     * @param {string} chain - The EVM source chain id.
+     * @returns {Promise<EvmSigner>} The signer.
+     */
+    private _getEvmSigner;
+    /**
      * Quotes the estimated costs and output of a swidge operation.
      * Returns a non-binding quote; the actual execution is performed
      * by {@link swidge}.
      *
-     * The source and destination chains are taken from the chain-qualified
-     * `fromToken`/`toToken` identifiers (`chain:tokenId`, e.g. '137:0x...' or
-     * 'Bitcoin:btc'), as returned by {@link getSupportedTokens}.
+     * `fromToken`/`toToken` are the provider token ids (`btc`, or the ERC-20
+     * contract address). The source chain is the account's chain; the
+     * destination chain is `toChain` (defaulting to the source chain). Without
+     * an account, qualify the source as `chain:tokenId` or set `config.chain`.
      *
      * @param {SwidgeOptions} options - The swidge options.
      * @returns {Promise<SwidgeQuote>} The quoted swidge details.
-     * @throws {import('./errors.js').SatoraInvalidOptionsError} If `fromToken` is not chain-qualified or no amount is given.
+     * @throws {import('./errors.js').SatoraInvalidOptionsError} If the route cannot be resolved or no amount is given.
      */
     quoteSwidge(options: SwidgeOptions): Promise<SwidgeQuote>;
     /**
@@ -139,21 +222,20 @@ export default class SatoraProtocol extends SwidgeProtocol {
      * wallet account, wait for the server to lock the destination, claim, and
      * wait for settlement.
      *
-     * Implemented directions:
-     * - **Arkade -> EVM**: the account (an Arkade wallet) funds the Arkade VHTLC
-     *   via `sendTransaction`; the EVM tokens are claimed gaslessly to
-     *   `options.recipient` (the EVM destination).
-     * - **EVM -> Arkade**: the account (an {@link EvmSigner}) funds the EVM HTLC
-     *   via `client.fundSwap`; the BTC is claimed to `options.recipient` (the
-     *   Arkade destination).
+     * The account is the source wallet, so `options.recipient` (the address on
+     * the destination chain) is always required. Pass `options.minAmountOut`
+     * (typically the `toTokenAmountMin` of the quote the user accepted) to
+     * abort — before any funds move — if the swap would deliver less.
      *
-     * Because the account is the source wallet, `options.recipient` (on the
-     * destination chain) is always required.
+     * Implemented directions: Arkade / Bitcoin / Lightning -> EVM and
+     * EVM -> Arkade / Bitcoin / Lightning. An EVM account is a WDK EVM wallet
+     * account (or an {@link EvmSigner}); it signs and sends the HTLC funding.
      *
-     * @param {SwidgeOptions} options - The swidge options (chain-qualified fromToken/toToken).
+     * @param {SwidgeOptions} options - The swidge options.
      * @param {SwidgeProtocolConfig} [config] - Optional provider-specific execution configuration.
      * @returns {Promise<SwidgeResult>} The swidge execution result.
      * @throws {import('./errors.js').SatoraInvalidOptionsError} If the account, direction, recipient, or amount is invalid.
+     * @throws {import('./errors.js').SatoraMinAmountOutError} If the swap would deliver less than `minAmountOut`.
      * @throws {Error} If the swap is refunded, expires, or times out.
      */
     swidge(options: SwidgeOptions, config?: SwidgeProtocolConfig): Promise<SwidgeResult>;
@@ -189,13 +271,13 @@ export default class SatoraProtocol extends SwidgeProtocol {
      * expired or was refunded).
      *
      * This is a recovery operation for a swap interrupted after {@link swidge}
-     * created and funded it (e.g. the process died mid-flight). It is driven by
-     * the swap client's persisted secret (mnemonic + storage); no account is
-     * needed, since the claim goes to the recipient recorded on the swap.
+     * created and funded it (e.g. the process died mid-flight). It needs the
+     * same account (the swap key is derived from it) and the same storage.
      *
      * @param {string} id - The swap id.
      * @param {{ timeoutMs?: number, intervalMs?: number }} [options] - Polling overrides.
      * @returns {Promise<SwidgeStatusResult & { id: string }>} The 'completed' status and transactions.
+     * @throws {import('./errors.js').SatoraInvalidOptionsError} If no account is bound.
      * @throws {Error} If the swap cannot be completed.
      */
     resumeSwidge(id: string, options?: {
@@ -209,10 +291,10 @@ export default class SatoraProtocol extends SwidgeProtocol {
      * Use this when {@link resumeSwidge} throws. The mechanism depends on the swap
      * direction:
      * - **EVM source** (EVM -> Arkade/Bitcoin/Lightning): reclaims the EVM HTLC
-     *   with the account's {@link EvmSigner}. Collaborative (gasless, no timelock
-     *   wait) by default; pass `options.manual` for the timelock-based refund.
-     *   The refund pays out the BTC-pegged HTLC token (tBTC/WBTC) to the
-     *   depositor.
+     *   with the account. Collaborative (gasless, no timelock wait) by default,
+     *   which needs an EOA signature; pass `options.manual` for the timelock-based
+     *   refund (works for any account, including ERC-4337 smart accounts). The
+     *   refund pays out the BTC-pegged HTLC token (tBTC/WBTC) to the depositor.
      * - **Arkade/Bitcoin source**: reclaims to the account's address via the
      *   satora refund (`options` are forwarded, e.g. an on-chain `feeRateSatPerVb`).
      * - **Lightning source**: cannot be refunded — the unpaid invoice expires.
@@ -235,6 +317,8 @@ export default class SatoraProtocol extends SwidgeProtocol {
     getSupportedChains(): Promise<SwidgeSupportedChain[]>;
     /**
      * Retrieves the tokens supported by the provider for swidge operations.
+     * Each token's `token` is the provider id to pass as `fromToken`/`toToken`
+     * (`btc`, or the ERC-20 contract address); `chain` carries its chain.
      *
      * @param {SwidgeSupportedTokensOptions} [options] - Optional filters for chain- or route-scoped token discovery.
      * @returns {Promise<SwidgeSupportedToken[]>} The supported tokens.

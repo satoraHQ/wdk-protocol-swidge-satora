@@ -46,10 +46,19 @@ function parseArgs (argv) {
   return { positional, flags }
 }
 
-function createProtocol (flags) {
+function createProtocol (flags, chain) {
   const baseUrl = flags['base-url'] || process.env.SATORA_BASE_URL
   const config = baseUrl ? { baseUrl } : {}
+  // Without an account the source chain must be declared for quotes.
+  if (chain !== undefined) config.chain = chain
   return new SatoraProtocol(undefined, config)
+}
+
+// Splits an optional chain-qualified token (`chain:tokenId`) into its parts.
+function splitToken (value) {
+  const text = String(value)
+  const index = text.indexOf(':')
+  return index === -1 ? { chain: undefined, token: text } : { chain: text.slice(0, index), token: text.slice(index + 1) }
 }
 
 async function chains (flags) {
@@ -73,10 +82,12 @@ async function tokens (flags) {
   const supported = await protocol.getSupportedTokens(options)
 
   console.log(`Supported tokens (${supported.length}):\n`)
+  console.log(`  ${'chain'.padEnd(10)} ${'token'.padEnd(44)} ${'symbol'.padEnd(8)} decimals`)
   for (const token of supported) {
-    // token.token is the chain-qualified id to pass to `quote` as --from/--to.
+    // token.token is the provider id (contract address or btc) to pass to
+    // `quote` as --from/--to, together with --from-chain/--to-chain.
     console.log(
-      `  ${token.token.padEnd(46)} ${token.symbol.padEnd(8)} decimals: ${String(token.decimals).padEnd(4)} ${token.name}`
+      `  ${String(token.chain).padEnd(10)} ${token.token.padEnd(44)} ${token.symbol.padEnd(8)} ${String(token.decimals).padEnd(4)} ${token.name}`
     )
   }
 }
@@ -109,41 +120,43 @@ function parseUnits (value, decimals) {
 }
 
 async function quote (flags) {
-  const protocol = createProtocol(flags)
+  if (!flags.from || !flags.to) throw new Error('quote requires --from <token> --from-chain <chain> --to <token> --to-chain <chain>')
+
+  // Tokens are provider ids (contract address or btc); the chains come from
+  // --from-chain / --to-chain. A chain-qualified `chain:token` is accepted too.
+  const from = splitToken(flags.from)
+  const to = splitToken(flags.to)
+  const fromChain = from.chain ?? flags['from-chain']
+  const toChain = to.chain ?? flags['to-chain'] ?? fromChain
+  if (fromChain === undefined) throw new Error('quote requires --from-chain <chain> (or a chain-qualified --from)')
+
+  const protocol = createProtocol(flags, fromChain)
 
   // Look up decimals up front: input amounts are given in decimal token units
   // and converted to base units, and the output is formatted the same way.
   const supported = await protocol.getSupportedTokens()
-  const byId = new Map(supported.map(token => [token.token, token]))
-  const decimalsOf = (tokenId) => {
-    const info = byId.get(tokenId)
-    if (!info) throw new Error(`unknown token "${tokenId}" — run the "tokens" command to list valid ids`)
-    return info.decimals
-  }
+  const lookup = (chain, token) => supported.find(info =>
+    String(info.chain).toLowerCase() === String(chain).toLowerCase() && info.token.toLowerCase() === token.toLowerCase()
+  )
+  const fromInfo = lookup(fromChain, from.token)
+  const toInfo = lookup(toChain, to.token)
+  if (!fromInfo) throw new Error(`unknown token "${from.token}" on ${fromChain} — run the "tokens" command to list valid ids`)
+  if (!toInfo) throw new Error(`unknown token "${to.token}" on ${toChain} — run the "tokens" command to list valid ids`)
 
-  const options = { fromToken: flags.from, toToken: flags.to }
-  if (flags['to-chain'] !== undefined) options.toChain = flags['to-chain']
+  const options = { fromToken: fromInfo.token, toToken: toInfo.token, toChain }
   if (flags.amount !== undefined) {
-    options.fromTokenAmount = parseUnits(flags.amount, decimalsOf(flags.from))
+    options.fromTokenAmount = parseUnits(flags.amount, fromInfo.decimals)
   } else if (flags['out-amount'] !== undefined) {
-    options.toTokenAmount = parseUnits(flags['out-amount'], decimalsOf(flags.to))
+    options.toTokenAmount = parseUnits(flags['out-amount'], toInfo.decimals)
   }
 
   const result = await protocol.quoteSwidge(options)
 
-  const format = (amount, tokenId) => {
-    const info = byId.get(tokenId)
-    if (!info) return `${amount} (base units)`
-    return `${formatUnits(amount, info.decimals)} ${info.symbol}`
-  }
-  const bare = (amount, tokenId) => {
-    const info = byId.get(tokenId)
-    return info ? formatUnits(amount, info.decimals) : String(amount)
-  }
+  const format = (amount, info) => `${formatUnits(amount, info.decimals)} ${info.symbol}`
 
   console.log('Quote:')
-  console.log(`  spend:   ${format(result.fromTokenAmount, options.fromToken)}  (${options.fromToken})`)
-  console.log(`  receive: ${format(result.toTokenAmount, options.toToken)} (min ${bare(result.toTokenAmountMin, options.toToken)})  (${options.toToken})`)
+  console.log(`  spend:   ${format(result.fromTokenAmount, fromInfo)}  (${fromInfo.token} on ${fromChain})`)
+  console.log(`  receive: ${format(result.toTokenAmount, toInfo)} (min ${formatUnits(result.toTokenAmountMin, toInfo.decimals)})  (${toInfo.token} on ${toChain})`)
   console.log('  fees:')
   for (const fee of result.fees) {
     const description = fee.description ? `  ${fee.description}` : ''
@@ -166,16 +179,16 @@ Usage:
 Commands:
   chains            List the chains supported by the satora protocol
   tokens            List the tokens supported by the satora protocol
-  quote             Quote a swidge using chain-qualified token ids, e.g.
-                    --from Bitcoin:btc --to 42161:0xfd08... --amount 0.001
+  quote             Quote a swidge, e.g.
+                    --from btc --from-chain Bitcoin --to 0xfd08... --to-chain 42161 --amount 0.001
 
 Options:
   --base-url <url>   Override the satora API base URL (or set SATORA_BASE_URL).
                      Defaults to the SDK's production endpoint.
-  --from-chain <id>  Source-chain filter (tokens command).
+  --from-chain <id>  Source-chain filter (tokens) / source chain (quote).
   --to-chain <id>    Dest-chain filter (tokens) / destination chain (quote).
-  --from <chain:id>  Source token, chain-qualified (quote).
-  --to <chain:id>    Destination token, chain-qualified (quote).
+  --from <token>     Source token id: contract address or btc (quote).
+  --to <token>       Destination token id: contract address or btc (quote).
   --amount <n>       Exact-in amount in source token units, e.g. 0.001 (quote).
   --out-amount <n>   Exact-out amount in destination token units (quote).`)
 }

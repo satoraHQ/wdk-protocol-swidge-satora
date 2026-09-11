@@ -15,40 +15,35 @@
 
 // End-to-end Bitcoin (on-chain) -> EVM swidge example. This MOVES REAL FUNDS.
 //
-// It derives a native-segwit (BIP-84) wallet from a persistent BIP-39 seed and
-// adapts it to the Bitcoin source account (it sends on-chain BTC to an
-// address). SatoraProtocol creates the swap, the wallet funds the on-chain
-// HTLC, and the EVM tokens are claimed to your recipient address. On-chain
-// confirmations make this the slowest direction.
+// It derives a WDK Bitcoin wallet account (@tetherto/wdk-wallet-btc, BIP-84
+// native segwit) from a persistent BIP-39 seed and hands it to SatoraProtocol
+// as the Bitcoin source. The account funds the on-chain HTLC and provides the
+// swap client's key material; the EVM tokens are claimed to your recipient
+// address. On-chain confirmations make this the slowest direction.
 //
-// UTXOs and broadcasting go through an Esplora API; only confirmed UTXOs are
-// spent. Configure via the shared examples/.env (see examples/.env.example):
+// The account talks to an Electrum server (or Blockbook). Configure via the
+// shared examples/.env (see examples/.env.example):
 //
-//   SATORA_MNEMONIC="twelve word seed phrase ..."   # persistent seed (shared)
-//   SATORA_ESPLORA=https://mempool.space/api          # Esplora API (optional)
-//   SATORA_BTC_FEE_RATE=2                              # sat/vB (optional; else Esplora estimate)
-//   SATORA_DB, SATORA_BASE_URL                         # optional
+//   SATORA_MNEMONIC="twelve word seed phrase ..."   # the wallet seed (shared)
+//   SATORA_BTC_ELECTRUM=electrum.blockstream.info:50002  # Electrum SSL server (optional)
+//   SATORA_BTC_BLOCKBOOK=https://btc1.trezor.io/api      # or a Blockbook API (optional)
+//   SATORA_BTC_FEE_RATE=2                              # sat/vB (optional)
+//   SATORA_DB, SATORA_BASE_URL, SATORA_ESPLORA         # optional
 //
 // Usage:
 //   node --env-file=examples/.env examples/satora-cli-btc.js address
 //   node --env-file=examples/.env examples/satora-cli-btc.js balance
 //   node --env-file=examples/.env examples/satora-cli-btc.js send --to bc1q... --amount 5000
 //   node --env-file=examples/.env examples/satora-cli-btc.js swap \
-//     --to 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
-//     --recipient 0xYourEvmAddress \
-//     --amount 20000
+//     --to 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 --to-chain 42161 \
+//     --recipient 0xYourEvmAddress --amount 20000
 //   node --env-file=examples/.env examples/satora-cli-btc.js status <swap-id>
 
-import { HDKey } from '@scure/bip32'
-import { mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
+import { validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english.js'
-import * as btc from '@scure/btc-signer'
+import WalletManagerBtc from '@tetherto/wdk-wallet-btc'
 
 import SatoraProtocol from '../index.js'
-
-// BIP-84 native-segwit path (index 0).
-const BTC_DERIVATION_PATH = "m/84'/0'/0'/0/0"
-const DUST_SATS = 330
 
 function parseArgs (argv) {
   const flags = {}
@@ -81,100 +76,35 @@ async function createStorage (dbPath) {
   }
 }
 
-const esplora = () => process.env.SATORA_ESPLORA || 'https://mempool.space/api'
-
-async function esploraGet (path) {
-  const res = await fetch(esplora() + path)
-  if (!res.ok) throw new Error(`esplora GET ${path} failed: ${res.status} ${await res.text()}`)
-  return res.json()
-}
-
-async function esploraPost (path, body) {
-  const res = await fetch(esplora() + path, { method: 'POST', body })
-  if (!res.ok) throw new Error(`esplora POST ${path} failed: ${res.status} ${await res.text()}`)
-  return (await res.text()).trim()
-}
-
-async function resolveFeeRate (flags) {
-  if (flags['fee-rate'] !== undefined && flags['fee-rate'] !== true) return Number(flags['fee-rate'])
-  if (process.env.SATORA_BTC_FEE_RATE) return Number(process.env.SATORA_BTC_FEE_RATE)
-  try {
-    const est = await esploraGet('/fee-estimates')
-    return Math.max(1, Math.ceil(est['6'] ?? est['3'] ?? 2))
-  } catch {
-    return 2
+// The WDK Bitcoin client: a Blockbook API if configured, else an Electrum SSL server.
+function btcClient () {
+  if (process.env.SATORA_BTC_BLOCKBOOK) {
+    return { type: 'blockbook-http', clientConfig: { url: process.env.SATORA_BTC_BLOCKBOOK } }
   }
+  const [host, port = '50002'] = (process.env.SATORA_BTC_ELECTRUM || 'electrum.blockstream.info:50002').split(':')
+  return { type: 'electrum', clientConfig: { host, port: Number(port), protocol: 'ssl' } }
 }
 
-// Derives a BIP-84 native-segwit wallet from the seed.
-function deriveWallet (mnemonic) {
-  const node = HDKey.fromMasterSeed(mnemonicToSeedSync(mnemonic, '')).derive(BTC_DERIVATION_PATH)
-  if (!node.privateKey || !node.publicKey) throw new Error('failed to derive the Bitcoin key from the seed')
-  const payment = btc.p2wpkh(node.publicKey, btc.NETWORK)
-  return { address: payment.address, script: payment.script, privateKey: node.privateKey }
+// Derives the WDK Bitcoin wallet account (BIP-84, index 0).
+async function buildBitcoinAccount (mnemonic) {
+  const manager = new WalletManagerBtc(mnemonic, { client: btcClient(), bip: 84, network: 'bitcoin' })
+  return manager.getAccount(0)
 }
 
-async function confirmedUtxos (address) {
-  const utxos = await esploraGet(`/address/${address}/utxo`)
-  return utxos.filter(u => u.status && u.status.confirmed)
+// Pins the fee rate the account uses when it funds the HTLC (swidge only
+// passes { to, value }); everything else is inherited from the account.
+function withFeeRate (account, feeRate) {
+  if (!feeRate) return account
+  const source = Object.create(account)
+  source.sendTransaction = (tx) => account.sendTransaction({ ...tx, feeRate })
+  return source
 }
 
-// Builds, signs, and broadcasts a payment to `to` for `amountSats`, spending
-// confirmed P2WPKH UTXOs. Returns the broadcast txid.
-async function sendBitcoin (wallet, to, amountSats, feeRate) {
-  const utxos = (await confirmedUtxos(wallet.address)).sort((a, b) => b.value - a.value)
-
-  const tx = new btc.Transaction()
-  let totalIn = 0
-  let selected = 0
-  const feeFor = (nIn) => Math.ceil((11 + nIn * 68 + 2 * 31) * feeRate)
-
-  for (const u of utxos) {
-    tx.addInput({
-      txid: Buffer.from(u.txid, 'hex'),
-      index: u.vout,
-      witnessUtxo: { script: wallet.script, amount: BigInt(u.value) }
-    })
-    totalIn += u.value
-    selected++
-    if (totalIn >= amountSats + feeFor(selected)) break
-  }
-
-  const fee = feeFor(selected)
-  if (totalIn < amountSats + fee) {
-    throw new Error(`insufficient confirmed balance: have ${totalIn} sats, need ${amountSats + fee} (amount ${amountSats} + fee ${fee})`)
-  }
-
-  tx.addOutputAddress(to, BigInt(amountSats), btc.NETWORK)
-  const change = totalIn - amountSats - fee
-  if (change >= DUST_SATS) tx.addOutputAddress(wallet.address, BigInt(change), btc.NETWORK)
-
-  tx.sign(wallet.privateKey)
-  tx.finalize()
-  return esploraPost('/tx', tx.hex)
-}
-
-// Adapts the wallet to the Bitcoin source account surface swidge needs.
-function toAccount (wallet, feeRate) {
-  return {
-    getAddress: async () => wallet.address,
-    async getBalance () {
-      const utxos = await confirmedUtxos(wallet.address)
-      return BigInt(utxos.reduce((sum, u) => sum + u.value, 0))
-    },
-    // The swidge funding step: send native BTC on-chain to the HTLC address.
-    async sendTransaction ({ to, value }) {
-      return { hash: await sendBitcoin(wallet, to, Number(value), feeRate) }
-    }
-  }
-}
-
-async function createProtocol (account, { mnemonic, dbPath }) {
+async function createProtocol (account, { dbPath }) {
   const { signerStorage, swapStorage } = await createStorage(dbPath)
   return new SatoraProtocol(account, {
-    mnemonic,
-    ...(account ? { accountChains: ['Bitcoin'] } : {}),
-    esploraUrl: esplora(),
+    chain: 'Bitcoin', // a Bitcoin account cannot be told apart from an Arkade one
+    esploraUrl: process.env.SATORA_ESPLORA || 'https://mempool.space/api',
     arkadeServerUrl: process.env.SATORA_ARKADE_SERVER || 'https://arkade.computer',
     ...(process.env.SATORA_BASE_URL ? { baseUrl: process.env.SATORA_BASE_URL } : {}),
     signerStorage,
@@ -191,20 +121,21 @@ function printResult (result) {
 }
 
 function usage () {
-  console.log(`satora-cli-btc — Bitcoin (on-chain) -> EVM swidge example
+  console.log(`satora-cli-btc — Bitcoin (on-chain) -> EVM swidge example (WDK Bitcoin wallet)
 
 Usage:
   node --env-file=examples/.env examples/satora-cli-btc.js <command> [options]
 
 Commands:
   address              Show the Bitcoin address (BIP-84 native segwit)
-  balance              Show the confirmed on-chain balance (sats)
+  balance              Show the on-chain balance (sats)
   send                 Send on-chain BTC:
                          --to <btc-address>      destination address
                          --amount <sats>         amount to send, in sats
-                         --fee-rate <sat/vB>     optional (or SATORA_BTC_FEE_RATE / Esplora estimate)
+                         --fee-rate <sat/vB>     optional (or SATORA_BTC_FEE_RATE)
   swap                 Perform a Bitcoin -> EVM swap:
-                         --to <chain:token>      destination token (e.g. 42161:0xfd08...)
+                         --to <address>          destination ERC-20 contract address (e.g. 0xfd08...)
+                         --to-chain <id>         destination EVM chain (default 42161)
                          --recipient <address>   EVM address to receive the tokens
                          --amount <sats>         amount to send, in sats
                          --fee-rate <sat/vB>     optional funding-tx fee rate
@@ -231,49 +162,57 @@ async function main () {
 
   const dbPath = process.env.SATORA_DB || './.satora.db'
 
-  // status/resume are read-only of the wallet.
-  if (command === 'status' || command === 'resume') {
+  // status is read-only — no account needed.
+  if (command === 'status') {
     const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
     if (!swapId) {
-      console.error(`${command} requires a swap id: ${command} <swap-id>`)
+      console.error('status requires a swap id: status <swap-id>')
       process.exit(1)
     }
-
-    const protocol = await createProtocol(undefined, { mnemonic, dbPath })
-    if (command === 'status') printResult(await protocol.getSwidgeStatus(swapId))
-    else {
-      console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
-      printResult(await protocol.resumeSwidge(swapId))
-    }
-
+    const protocol = await createProtocol(undefined, { dbPath })
+    printResult(await protocol.getSwidgeStatus(swapId))
     process.exit(0)
   }
 
-  const wallet = deriveWallet(mnemonic)
+  const feeRate = flags['fee-rate'] !== undefined && flags['fee-rate'] !== true
+    ? Number(flags['fee-rate'])
+    : (process.env.SATORA_BTC_FEE_RATE ? Number(process.env.SATORA_BTC_FEE_RATE) : undefined)
+
+  const account = withFeeRate(await buildBitcoinAccount(mnemonic), feeRate)
+  const address = await account.getAddress()
 
   if (command === 'address') {
-    console.log('Bitcoin address:', wallet.address)
+    console.log('Bitcoin address:', address)
     process.exit(0)
   }
 
   if (command === 'balance') {
-    const utxos = await confirmedUtxos(wallet.address)
-    console.log('Bitcoin address:', wallet.address)
-    console.log('Balance:', utxos.reduce((sum, u) => sum + u.value, 0), 'sats (confirmed)')
+    console.log('Bitcoin address:', address)
+    console.log('Balance:', await account.getBalance(), 'sats')
     process.exit(0)
   }
-
-  const feeRate = await resolveFeeRate(flags)
 
   if (command === 'send') {
     if (!flags.to || flags.amount === undefined || flags.amount === true) {
       console.error('send requires: --to <btc-address> --amount <sats>')
       process.exit(1)
     }
-    console.log('Bitcoin address:', wallet.address)
-    console.log(`Sending ${flags.amount} sats to ${flags.to} (fee rate ${feeRate} sat/vB) ...`)
-    const txid = await sendBitcoin(wallet, flags.to, Number(flags.amount), feeRate)
-    console.log('Sent. txid:', txid)
+    console.log('Bitcoin address:', address)
+    console.log(`Sending ${flags.amount} sats to ${flags.to} ...`)
+    const { hash } = await account.sendTransaction({ to: flags.to, value: BigInt(flags.amount) })
+    console.log('Sent. txid:', hash)
+    process.exit(0)
+  }
+
+  if (command === 'resume') {
+    const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
+    if (!swapId) {
+      console.error('resume requires a swap id: resume <swap-id>')
+      process.exit(1)
+    }
+    const protocol = await createProtocol(account, { dbPath })
+    console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
+    printResult(await protocol.resumeSwidge(swapId))
     process.exit(0)
   }
 
@@ -284,19 +223,21 @@ async function main () {
   }
 
   if (!flags.to || !flags.recipient || flags.amount === undefined || flags.amount === true) {
-    console.error('swap requires: --to <chain:token> --recipient <evm-address> --amount <sats>')
+    console.error('swap requires: --to <token-address> [--to-chain <id>] --recipient <evm-address> --amount <sats>')
     process.exit(1)
   }
 
-  const protocol = await createProtocol(toAccount(wallet, feeRate), { mnemonic, dbPath })
+  const toChain = Number(flags['to-chain'] || 42161)
+  const protocol = await createProtocol(account, { dbPath })
 
-  console.log('Bitcoin address:', wallet.address)
-  console.log(`\nSwapping ${flags.amount} sats (Bitcoin) -> ${flags.to} for ${flags.recipient} ...`)
+  console.log('Bitcoin address:', address)
+  console.log(`\nSwapping ${flags.amount} sats (Bitcoin) -> ${flags.to} on ${toChain} for ${flags.recipient} ...`)
   console.log('(funds the on-chain HTLC, then waits for confirmations — this is the slow one)\n')
 
   const result = await protocol.swidge({
-    fromToken: 'Bitcoin:btc',
+    fromToken: 'btc',
     toToken: flags.to,
+    toChain,
     fromTokenAmount: BigInt(flags.amount),
     recipient: flags.recipient
   })
@@ -304,7 +245,7 @@ async function main () {
   console.log('Done:')
   console.log('  swap id: ', result.id)
   console.log('  spent:   ', result.fromTokenAmount, 'sats')
-  console.log('  received:', result.toTokenAmount, `(${flags.to})`)
+  console.log('  received:', result.toTokenAmount, `(${flags.to} on ${toChain}, base units)`)
   for (const tx of result.transactions) console.log(`  ${tx.type} tx (${tx.chain}): ${tx.hash}`)
 }
 

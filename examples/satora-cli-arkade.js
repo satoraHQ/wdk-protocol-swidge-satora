@@ -16,9 +16,10 @@
 // End-to-end Arkade -> EVM swidge example. This MOVES REAL FUNDS.
 //
 // It builds an Arkade wallet from a persistent BIP-39 seed and wraps it as a
-// WDK account, then hands it to SatoraProtocol. The account funds the Arkade
-// side; the swap client (same seed, backed by a SQLite database) drives the
-// HTLC and claims the EVM tokens gaslessly to your recipient address.
+// WDK-style account, then hands it to SatoraProtocol. The account funds the
+// Arkade side and provides the swap client's key material (via `keyPair`);
+// the swap client (backed by a SQLite database) drives the HTLC and claims the
+// EVM tokens gaslessly to your recipient address.
 //
 // Requires a FUNDED Arkade wallet. Configure via the shared examples/.env file
 // (see examples/.env.example), loaded with Node's --env-file:
@@ -35,7 +36,7 @@
 //
 //   # 2. run the swap
 //   node --env-file=examples/.env examples/satora-cli-arkade.js swap \
-//     --to 42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 \
+//     --to 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9 --to-chain 42161 \
 //     --recipient 0xYourEvmAddress \
 //     --amount 0.0001
 //
@@ -106,13 +107,12 @@ async function createStorage (dbPath) {
 
 // Builds a SatoraProtocol backed by persistent storage. Pass `undefined` as the
 // account for read-only commands (status).
-async function createProtocol (account, { mnemonic, arkadeServerUrl, esploraUrl, dbPath }) {
+async function createProtocol (account, { arkadeServerUrl, esploraUrl, dbPath }) {
   const { signerStorage, swapStorage } = await createStorage(dbPath)
   return new SatoraProtocol(account, {
-    mnemonic,
     arkadeServerUrl,
     esploraUrl,
-    accountChains: ['Arkade'], // the account is an Arkade wallet
+    chain: 'Arkade', // the account is an Arkade wallet (indistinguishable from a Bitcoin one)
     ...(process.env.SATORA_BASE_URL ? { baseUrl: process.env.SATORA_BASE_URL } : {}),
     signerStorage,
     swapStorage
@@ -121,7 +121,8 @@ async function createProtocol (account, { mnemonic, arkadeServerUrl, esploraUrl,
 
 /**
  * Builds an Arkade wallet from the seed and adapts it to the minimal WDK
- * account surface `swidge` needs: getAddress + sendTransaction({ to, value }).
+ * account surface the protocol needs: getAddress + sendTransaction({ to, value })
+ * to fund, and keyPair so the swap key can be derived from the account.
  */
 async function buildArkadeAccount (mnemonic, { arkadeServerUrl, esploraUrl }) {
   const seed = mnemonicToSeedSync(mnemonic, '')
@@ -140,6 +141,8 @@ async function buildArkadeAccount (mnemonic, { arkadeServerUrl, esploraUrl }) {
   })
 
   return {
+    // The swap client's key material is derived from this (never persisted).
+    keyPair: { privateKey: node.privateKey, publicKey: node.publicKey },
     async getAddress () {
       return wallet.getAddress()
     },
@@ -167,7 +170,8 @@ Commands:
                       --to <arkade-address>   destination Arkade address
                       --amount <btc>          amount to send, in BTC (e.g. 0.0001)
   swap              Perform an Arkade -> EVM swap:
-                      --to <chain:token>      destination token (e.g. 42161:0xfd08...)
+                      --to <address>          destination ERC-20 contract address (e.g. 0xfd08...)
+                      --to-chain <id>         destination EVM chain (default 42161)
                       --recipient <address>   EVM address to receive the tokens
                       --amount <btc>          amount to send, in BTC (e.g. 0.0001)
   status <swap-id>  Show the status of a swap by id
@@ -205,7 +209,7 @@ async function main () {
       process.exit(1)
     }
 
-    const statusProtocol = await createProtocol(undefined, { mnemonic, arkadeServerUrl, esploraUrl, dbPath })
+    const statusProtocol = await createProtocol(undefined, { arkadeServerUrl, esploraUrl, dbPath })
     const { status, transactions } = await statusProtocol.getSwidgeStatus(swapId)
     console.log('swap id:', swapId)
     console.log('status: ', status)
@@ -216,8 +220,12 @@ async function main () {
     process.exit(0)
   }
 
-  // `resume` drives a swap to completion via the client's stored secret — no
-  // Arkade wallet needed (the claim goes to the swap's recorded recipient).
+  // The address/send/refund/resume/swap commands need the Arkade wallet: it
+  // funds, receives refunds, and provides the swap key.
+  const account = await buildArkadeAccount(mnemonic, { arkadeServerUrl, esploraUrl })
+
+  // `resume` drives a swap to completion with the swap key derived from the
+  // account (the claim goes to the swap's recorded recipient).
   if (command === 'resume') {
     const swapId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined
     if (!swapId) {
@@ -225,7 +233,7 @@ async function main () {
       process.exit(1)
     }
 
-    const resumeProtocol = await createProtocol(undefined, { mnemonic, arkadeServerUrl, esploraUrl, dbPath })
+    const resumeProtocol = await createProtocol(account, { arkadeServerUrl, esploraUrl, dbPath })
     console.log(`Resuming swap ${swapId} (driving it to completion) ...`)
 
     const result = await resumeProtocol.resumeSwidge(swapId)
@@ -236,9 +244,6 @@ async function main () {
 
     process.exit(0)
   }
-
-  // The address/send/refund/swap commands fund or read the Arkade wallet.
-  const account = await buildArkadeAccount(mnemonic, { arkadeServerUrl, esploraUrl })
 
   if (command === 'address' || command === 'balance') {
     console.log('Arkade wallet:', await account.getAddress())
@@ -270,7 +275,7 @@ async function main () {
       process.exit(1)
     }
 
-    const protocol = await createProtocol(account, { mnemonic, arkadeServerUrl, esploraUrl, dbPath })
+    const protocol = await createProtocol(account, { arkadeServerUrl, esploraUrl, dbPath })
     console.log(`Refunding swap ${swapId} to ${await account.getAddress()} ...`)
 
     const result = await protocol.refundSwidge(swapId)
@@ -290,24 +295,26 @@ async function main () {
   }
 
   if (!flags.to || !flags.recipient || flags.amount === undefined || flags.amount === true) {
-    console.error('swap requires: --to <chain:token> --recipient <evm-address> --amount <btc-amount>')
+    console.error('swap requires: --to <token-address> [--to-chain <id>] --recipient <evm-address> --amount <btc-amount>')
     process.exit(1)
   }
 
   console.log('Arkade wallet:', await account.getAddress())
   console.log('Balance:      ', await account.getBalance(), 'sats')
 
-  const protocol = await createProtocol(account, { mnemonic, arkadeServerUrl, esploraUrl, dbPath })
+  const protocol = await createProtocol(account, { arkadeServerUrl, esploraUrl, dbPath })
 
   // --amount is BTC; convert to sats.
   const amountSats = BigInt(Math.round(Number(flags.amount) * 1e8))
+  const toChain = Number(flags['to-chain'] || 42161)
 
-  console.log(`\nSwapping ${flags.amount} BTC (Arkade) -> ${flags.to} for ${flags.recipient} ...`)
+  console.log(`\nSwapping ${flags.amount} BTC (Arkade) -> ${flags.to} on ${toChain} for ${flags.recipient} ...`)
   console.log('(this drives the whole HTLC flow and can take a little while)\n')
 
   const result = await protocol.swidge({
-    fromToken: 'Arkade:btc',
+    fromToken: 'btc',
     toToken: flags.to,
+    toChain,
     fromTokenAmount: amountSats,
     recipient: flags.recipient
   })
@@ -315,7 +322,7 @@ async function main () {
   console.log('Done:')
   console.log('  swap id: ', result.id)
   console.log('  spent:   ', result.fromTokenAmount, 'sats')
-  console.log('  received:', result.toTokenAmount, `(${flags.to})`)
+  console.log('  received:', result.toTokenAmount, `(${flags.to} on ${toChain}, base units)`)
   for (const tx of result.transactions) console.log(`  ${tx.type} tx (${tx.chain}): ${tx.hash}`)
 }
 

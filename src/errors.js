@@ -27,3 +27,23 @@ export class SatoraInvalidOptionsError extends Error {
     this.name = 'SatoraInvalidOptionsError'
   }
 }
+
+/**
+ * Thrown by `swidge` when the amount the swap would deliver is below the
+ * caller's `minAmountOut` guard. Raised before any funds move: the created
+ * swap is left unfunded and simply expires.
+ */
+export class SatoraMinAmountOutError extends Error {
+  /**
+   * @param {string} swapId - The id of the (unfunded) swap.
+   * @param {bigint} toTokenAmount - The amount the swap would deliver.
+   * @param {bigint} minAmountOut - The caller's minimum.
+   */
+  constructor (swapId, toTokenAmount, minAmountOut) {
+    super(`swap ${swapId} would deliver ${toTokenAmount} but minAmountOut is ${minAmountOut}; not funding it`)
+    this.name = 'SatoraMinAmountOutError'
+    this.swapId = swapId
+    this.toTokenAmount = toTokenAmount
+    this.minAmountOut = minAmountOut
+  }
+}

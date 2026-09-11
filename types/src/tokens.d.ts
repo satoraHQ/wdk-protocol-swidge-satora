@@ -1,17 +1,12 @@
 export type SwidgeSupportedToken = import('@tetherto/wdk-wallet/protocols').SwidgeSupportedToken;
 /**
- * Builds a chain-qualified WDK token identifier.
+ * Splits a token identifier into its parts. The WDK convention is a bare
+ * token id — an ERC-20 contract address, or `btc` — with the chain coming from
+ * the account (source) or `toChain` (destination). A chain-qualified form
+ * (`chain:tokenId`, e.g. `42161:0x...` or `Lightning:btc`) is also accepted
+ * and yields `chain`; otherwise `chain` is undefined.
  *
- * @param {string | number} chain - The satora chain identifier.
- * @param {string} tokenId - The satora token id ('btc' or a contract address).
- * @returns {string} The `chain:tokenId` identifier.
- */
-export declare function composeTokenId(chain: string | number, tokenId: string): string;
-/**
- * Splits a chain-qualified WDK token identifier into its parts. If the
- * identifier is not chain-qualified, `chain` is undefined.
- *
- * @param {string} token - The token identifier (`chain:tokenId` or `tokenId`).
+ * @param {string} token - The token identifier (`tokenId` or `chain:tokenId`).
  * @returns {{ chain: string | undefined, tokenId: string }} The parts.
  */
 export declare function parseTokenId(token: string): {
@@ -19,10 +14,10 @@ export declare function parseTokenId(token: string): {
     tokenId: string;
 };
 /**
- * Maps a satora `TokenInfo` to a WDK {@link SwidgeSupportedToken}. The `token`
- * identifier is chain-qualified (`chain:tokenId`) so it can be passed straight
- * back as `fromToken`/`toToken`. For EVM tokens the contract address is also
- * surfaced as `address`.
+ * Maps a satora `TokenInfo` to a WDK {@link SwidgeSupportedToken}. `token` is
+ * the bare provider token id (`btc`, or the ERC-20 contract address), which can
+ * be passed straight back as `fromToken`/`toToken`; the chain is carried by
+ * `chain`. For EVM tokens the contract address is also surfaced as `address`.
  *
  * @param {Object} info - The satora token info.
  * @param {string} info.token_id - The provider-specific token identifier.

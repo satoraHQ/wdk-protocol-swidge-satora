@@ -17,9 +17,11 @@
 import { SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
 import { Client } from '@satora/swap'
 
-import { toChainId, toSupportedChain } from './chains.js'
+import { isEvmChain, normalizeChain, toSupportedChain } from './chains.js'
 import { parseTokenId, toSupportedToken } from './tokens.js'
-import { SatoraInvalidOptionsError } from './errors.js'
+import { SatoraInvalidOptionsError, SatoraMinAmountOutError } from './errors.js'
+import { deriveSwapXprv } from './swap-key.js'
+import { detectEvmChainId, toEvmSigner } from './evm-signer.js'
 
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccount} IWalletAccount */
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccountReadOnly} IWalletAccountReadOnly */
@@ -45,20 +47,28 @@ import { SatoraInvalidOptionsError } from './errors.js'
 
 /**
  * @typedef {Object} SatoraProtocolConfig
+ * @property {string | number} [chain] - The chain the wallet account operates on, i.e. the swidge **source** chain: an EVM chain id (1, 137, 42161) or 'Bitcoin' | 'Arkade' | 'Lightning'. Detected automatically for WDK EVM accounts (from their provider) and Lightning accounts; required for Bitcoin and Arkade accounts.
  * @property {number} [defaultSlippage] - The default slippage tolerance as a decimal (e.g., 0.01 for 1%).
+ * @property {number} [feeRateSatPerVb] - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
+ * @property {number} [lightningMaxFeeSats] - Maximum routing fee (sats) a Lightning account may pay for the swap invoice.
+ * @property {WalletStorage} [signerStorage] - Persists the swap client's key index. Recommended for fund-moving operations so an interrupted swap survives a restart.
+ * @property {SwapStorage} [swapStorage] - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
  * @property {string} [baseUrl] - Override the satora API base URL. Defaults to the SDK's production endpoint.
- * @property {string} [mnemonic] - BIP39 mnemonic for the swap client's secret material (HTLC preimage + gasless-claim key). Separate from the funding account. Not required for read-only operations (chains, tokens, quotes).
  * @property {string} [arkadeServerUrl] - Override the Arkade server URL.
  * @property {string} [esploraUrl] - Override the Esplora (Bitcoin) API URL.
- * @property {WalletStorage} [signerStorage] - Persists the seed / key index (the swap client's database). Recommended for fund-moving operations so an interrupted swap survives a restart. Omit for in-memory (not recoverable across restarts).
- * @property {SwapStorage} [swapStorage] - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
- * @property {(string | number)[]} [accountChains] - The chains the provided wallet account can fund/operate on (e.g. ['Arkade'] for an Arkade wallet, or [1, 137, 42161] for an EVM wallet). When set, `swidge` validates that the source chain is one of these.
- * @property {number} [feeRateSatPerVb] - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
  */
 
 /**
  * @typedef {Object} SatoraRefundOptions
- * @property {boolean} [manual] - For an EVM-sourced swap: use the timelock-based refund (user pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+ * @property {boolean} [manual] - For an EVM-sourced swap: use the timelock-based refund (the account pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+ */
+
+/**
+ * @typedef {Object} SwidgeRoute
+ * @property {string} sourceChain - The satora source chain id.
+ * @property {string} sourceToken - The source token id (`btc` or a contract address).
+ * @property {string} targetChain - The satora destination chain id.
+ * @property {string} targetToken - The destination token id.
  */
 
 export default class SatoraProtocol extends SwidgeProtocol {
@@ -81,6 +91,10 @@ export default class SatoraProtocol extends SwidgeProtocol {
   /**
    * Creates a new satora swidge protocol.
    *
+   * The account is the **source** wallet: it funds the swap on its own chain
+   * (`config.chain`, or detected from the account) and also provides the swap
+   * client's key material, so no separate secret is needed.
+   *
    * @overload
    * @param {IWalletAccount} account - The wallet account to use to interact with the protocol.
    * @param {SatoraProtocolConfig} [config] - The satora protocol configuration.
@@ -98,28 +112,157 @@ export default class SatoraProtocol extends SwidgeProtocol {
 
     /** @private */
     this._clientPromise = undefined
+
+    /** @private */
+    this._signingClientPromise = undefined
+
+    /** @private */
+    this._evmSignerPromise = undefined
+
+    /** @private */
+    this._detectedChain = undefined
   }
 
   /**
-   * Lazily constructs (and memoizes) the underlying satora swap client.
-   * Read-only operations build a stateless client; a mnemonic is only
-   * required for fund-moving operations.
+   * Lazily constructs (and memoizes) a read-only satora swap client, used for
+   * discovery, quotes and status lookups.
    *
    * @protected
    * @returns {Promise<SatoraClient>} The satora swap client.
    */
   async _getClient () {
-    if (!this._clientPromise) {
-      let builder = Client.builder()
-      if (this._config.baseUrl) builder = builder.withBaseUrl(this._config.baseUrl)
-      if (this._config.arkadeServerUrl) builder = builder.withArkadeServerUrl(this._config.arkadeServerUrl)
-      if (this._config.esploraUrl) builder = builder.withEsploraUrl(this._config.esploraUrl)
-      if (this._config.signerStorage) builder = builder.withSignerStorage(this._config.signerStorage)
-      if (this._config.swapStorage) builder = builder.withSwapStorage(this._config.swapStorage)
-      if (this._config.mnemonic) builder = builder.withMnemonic(this._config.mnemonic)
-      this._clientPromise = builder.build()
-    }
+    if (!this._clientPromise) this._clientPromise = this._buildClient()
     return this._clientPromise
+  }
+
+  /**
+   * Lazily constructs (and memoizes) the signing satora swap client, whose key
+   * material (HTLC preimage + claim/refund keys) is derived from the wallet
+   * account. Required by every fund-moving operation.
+   *
+   * @protected
+   * @returns {Promise<SatoraClient>} The satora swap client.
+   * @throws {SatoraInvalidOptionsError} If no account is bound or it cannot derive the swap key.
+   */
+  async _getSigningClient () {
+    if (!this._account) {
+      throw new SatoraInvalidOptionsError('this operation requires a wallet account')
+    }
+    if (!this._signingClientPromise) {
+      this._signingClientPromise = deriveSwapXprv(this._account).then(xprv => this._buildClient(xprv))
+    }
+    return this._signingClientPromise
+  }
+
+  /**
+   * @private
+   * @param {string} [xprv] - The swap client's key material; omitted for a read-only client.
+   * @returns {Promise<SatoraClient>} The satora swap client.
+   */
+  _buildClient (xprv) {
+    let builder = Client.builder()
+    if (this._config.baseUrl) builder = builder.withBaseUrl(this._config.baseUrl)
+    if (this._config.arkadeServerUrl) builder = builder.withArkadeServerUrl(this._config.arkadeServerUrl)
+    if (this._config.esploraUrl) builder = builder.withEsploraUrl(this._config.esploraUrl)
+    if (this._config.signerStorage) builder = builder.withSignerStorage(this._config.signerStorage)
+    if (this._config.swapStorage) builder = builder.withSwapStorage(this._config.swapStorage)
+    if (xprv) builder = builder.withXprv(xprv)
+    return builder.build()
+  }
+
+  /**
+   * Resolves the swidge route. The source chain is the account's chain
+   * (`config.chain`, or detected from the account); the destination chain is
+   * `toChain`, defaulting to the source chain. Tokens are bare provider ids
+   * (`btc` or a contract address); a chain-qualified `chain:tokenId` is also
+   * accepted on either side.
+   *
+   * @protected
+   * @param {SwidgeOptions} options - The swidge options.
+   * @returns {Promise<SwidgeRoute>} The route.
+   * @throws {SatoraInvalidOptionsError} If a token is missing or the source chain cannot be determined.
+   */
+  async _resolveRoute (options) {
+    if (!options.fromToken || !options.toToken) {
+      throw new SatoraInvalidOptionsError('fromToken and toToken are required')
+    }
+
+    const source = parseTokenId(options.fromToken)
+    const target = parseTokenId(options.toToken)
+
+    const sourceChain = await this._resolveSourceChain(source.chain)
+    const targetChain = target.chain !== undefined
+      ? normalizeChain(target.chain)
+      : options.toChain !== undefined && options.toChain !== null
+        ? normalizeChain(options.toChain)
+        : sourceChain
+
+    return { sourceChain, sourceToken: source.tokenId, targetChain, targetToken: target.tokenId }
+  }
+
+  /**
+   * @private
+   * @param {string} [qualified] - The chain prefix carried by `fromToken`, if any.
+   * @returns {Promise<string>} The satora source chain id.
+   */
+  async _resolveSourceChain (qualified) {
+    const declared = this._config.chain !== undefined && this._config.chain !== null
+      ? normalizeChain(this._config.chain)
+      : undefined
+    const fromToken = qualified !== undefined ? normalizeChain(qualified) : undefined
+
+    if (declared !== undefined && fromToken !== undefined && declared !== fromToken) {
+      throw new SatoraInvalidOptionsError(
+        `fromToken is on chain "${fromToken}" but the account operates on "${declared}" (config.chain)`
+      )
+    }
+
+    const chain = declared ?? fromToken ?? await this._detectAccountChain()
+    if (chain === undefined) {
+      throw new SatoraInvalidOptionsError(
+        'cannot determine the source chain: set config.chain to the account\'s chain ' +
+        '(e.g. 42161, "Bitcoin", "Arkade", "Lightning") or qualify fromToken as "chain:tokenId"'
+      )
+    }
+    return chain
+  }
+
+  /**
+   * Detects the account's chain: Lightning accounts pay invoices, EVM accounts
+   * report their chain id through their provider. Bitcoin and Arkade accounts
+   * are indistinguishable and must declare `config.chain`.
+   *
+   * @private
+   * @returns {Promise<string | undefined>} The satora chain id, if detectable.
+   */
+  async _detectAccountChain () {
+    if (this._detectedChain !== undefined) return this._detectedChain ?? undefined
+
+    const account = this._account
+    let chain
+    if (account) {
+      if (typeof account.payLightningInvoice === 'function' || typeof account.payInvoice === 'function') {
+        chain = 'Lightning'
+      } else {
+        const chainId = await detectEvmChainId(account)
+        if (chainId !== undefined) chain = String(chainId)
+      }
+    }
+
+    this._detectedChain = chain ?? null
+    return chain
+  }
+
+  /**
+   * Adapts the bound account to the SDK's {@link EvmSigner} (memoized).
+   *
+   * @private
+   * @param {string} chain - The EVM source chain id.
+   * @returns {Promise<EvmSigner>} The signer.
+   */
+  async _getEvmSigner (chain) {
+    if (!this._evmSignerPromise) this._evmSignerPromise = toEvmSigner(this._account, Number(chain))
+    return this._evmSignerPromise
   }
 
   /**
@@ -127,39 +270,29 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * Returns a non-binding quote; the actual execution is performed
    * by {@link swidge}.
    *
-   * The source and destination chains are taken from the chain-qualified
-   * `fromToken`/`toToken` identifiers (`chain:tokenId`, e.g. '137:0x...' or
-   * 'Bitcoin:btc'), as returned by {@link getSupportedTokens}.
+   * `fromToken`/`toToken` are the provider token ids (`btc`, or the ERC-20
+   * contract address). The source chain is the account's chain; the
+   * destination chain is `toChain` (defaulting to the source chain). Without
+   * an account, qualify the source as `chain:tokenId` or set `config.chain`.
    *
    * @param {SwidgeOptions} options - The swidge options.
    * @returns {Promise<SwidgeQuote>} The quoted swidge details.
-   * @throws {import('./errors.js').SatoraInvalidOptionsError} If `fromToken` is not chain-qualified or no amount is given.
+   * @throws {import('./errors.js').SatoraInvalidOptionsError} If the route cannot be resolved or no amount is given.
    */
   async quoteSwidge (options) {
-    const source = parseTokenId(options.fromToken)
-    if (source.chain === undefined) {
-      throw new SatoraInvalidOptionsError(
-        'fromToken must be chain-qualified, e.g. "137:0x..." or "Bitcoin:btc"'
-      )
-    }
-
-    const target = parseTokenId(options.toToken)
-    // The destination chain comes from the token; falling back to the toChain
-    // option, then to the source chain (a same-chain swap).
-    const targetChain = target.chain ??
-      (options.toChain !== undefined && options.toChain !== null ? String(options.toChain) : source.chain)
+    const route = await this._resolveRoute(options)
 
     const params = {
-      sourceChain: source.chain,
-      sourceToken: source.tokenId,
-      targetChain,
-      targetToken: target.tokenId
+      sourceChain: route.sourceChain,
+      sourceToken: route.sourceToken,
+      targetChain: route.targetChain,
+      targetToken: route.targetToken
     }
 
     if (options.fromTokenAmount !== undefined && options.fromTokenAmount !== null) {
-      params.sourceAmount = Number(options.fromTokenAmount)
+      params.sourceAmount = BigInt(options.fromTokenAmount)
     } else if (options.toTokenAmount !== undefined && options.toTokenAmount !== null) {
-      params.targetAmount = Number(options.toTokenAmount)
+      params.targetAmount = BigInt(options.toTokenAmount)
     } else {
       throw new SatoraInvalidOptionsError(
         'either fromTokenAmount (exact-in) or toTokenAmount (exact-out) is required'
@@ -186,21 +319,20 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * wallet account, wait for the server to lock the destination, claim, and
    * wait for settlement.
    *
-   * Implemented directions:
-   * - **Arkade -> EVM**: the account (an Arkade wallet) funds the Arkade VHTLC
-   *   via `sendTransaction`; the EVM tokens are claimed gaslessly to
-   *   `options.recipient` (the EVM destination).
-   * - **EVM -> Arkade**: the account (an {@link EvmSigner}) funds the EVM HTLC
-   *   via `client.fundSwap`; the BTC is claimed to `options.recipient` (the
-   *   Arkade destination).
+   * The account is the source wallet, so `options.recipient` (the address on
+   * the destination chain) is always required. Pass `options.minAmountOut`
+   * (typically the `toTokenAmountMin` of the quote the user accepted) to
+   * abort — before any funds move — if the swap would deliver less.
    *
-   * Because the account is the source wallet, `options.recipient` (on the
-   * destination chain) is always required.
+   * Implemented directions: Arkade / Bitcoin / Lightning -> EVM and
+   * EVM -> Arkade / Bitcoin / Lightning. An EVM account is a WDK EVM wallet
+   * account (or an {@link EvmSigner}); it signs and sends the HTLC funding.
    *
-   * @param {SwidgeOptions} options - The swidge options (chain-qualified fromToken/toToken).
+   * @param {SwidgeOptions} options - The swidge options.
    * @param {SwidgeProtocolConfig} [config] - Optional provider-specific execution configuration.
    * @returns {Promise<SwidgeResult>} The swidge execution result.
    * @throws {import('./errors.js').SatoraInvalidOptionsError} If the account, direction, recipient, or amount is invalid.
+   * @throws {import('./errors.js').SatoraMinAmountOutError} If the swap would deliver less than `minAmountOut`.
    * @throws {Error} If the swap is refunded, expires, or times out.
    */
   async swidge (options, config) {
@@ -209,10 +341,7 @@ export default class SatoraProtocol extends SwidgeProtocol {
       throw new SatoraInvalidOptionsError('swidge requires a wallet account to fund the swap')
     }
 
-    const source = parseTokenId(options.fromToken)
-    const target = parseTokenId(options.toToken)
-    const targetChain = target.chain ??
-      (options.toChain !== undefined && options.toChain !== null ? String(options.toChain) : source.chain)
+    const route = await this._resolveRoute(options)
 
     const recipient = options.recipient
     if (!recipient) {
@@ -221,62 +350,50 @@ export default class SatoraProtocol extends SwidgeProtocol {
       )
     }
 
-    // The account funds the source side, so it must operate on the source chain.
-    // WDK accounts expose no chain id, so the caller declares the account's
-    // chains via config.accountChains; when set, the source chain must be one.
-    if (this._config.accountChains) {
-      const supported = new Set(this._config.accountChains.map(chain => String(chain)))
-      if (!supported.has(String(source.chain))) {
-        throw new SatoraInvalidOptionsError(
-          `the account does not support the source chain "${source.chain}" (accountChains: ${this._config.accountChains.join(', ')})`
-        )
-      }
-    }
+    const client = await this._getSigningClient()
+    const context = { route, recipient, options }
 
-    const client = await this._getClient()
-
-    if (source.chain === 'Arkade' && isEvmChain(targetChain)) {
-      return this._swidgeArkadeToEvm(client, account, { target, targetChain, recipient, options })
+    const { sourceChain, targetChain } = route
+    if (sourceChain === 'Arkade' && isEvmChain(targetChain)) {
+      return this._swidgeArkadeToEvm(client, account, context)
     }
-    if (source.chain === 'Bitcoin' && isEvmChain(targetChain)) {
-      return this._swidgeBitcoinToEvm(client, account, { target, targetChain, recipient, options })
+    if (sourceChain === 'Bitcoin' && isEvmChain(targetChain)) {
+      return this._swidgeBitcoinToEvm(client, account, context)
     }
-    if (source.chain === 'Lightning' && isEvmChain(targetChain)) {
-      return this._swidgeLightningToEvm(client, account, { target, targetChain, recipient, options })
+    if (sourceChain === 'Lightning' && isEvmChain(targetChain)) {
+      return this._swidgeLightningToEvm(client, account, context)
     }
-    if (isEvmChain(source.chain) && target.chain === 'Arkade') {
-      return this._swidgeEvmToArkade(client, account, { source, recipient, options })
+    if (isEvmChain(sourceChain) && targetChain === 'Arkade') {
+      return this._swidgeEvmToArkade(client, context)
     }
-    if (isEvmChain(source.chain) && target.chain === 'Bitcoin') {
-      return this._swidgeEvmToBitcoin(client, account, { source, recipient, options })
+    if (isEvmChain(sourceChain) && targetChain === 'Bitcoin') {
+      return this._swidgeEvmToBitcoin(client, context)
     }
-    if (isEvmChain(source.chain) && target.chain === 'Lightning') {
-      return this._swidgeEvmToLightning(client, account, { source, recipient, options })
+    if (isEvmChain(sourceChain) && targetChain === 'Lightning') {
+      return this._swidgeEvmToLightning(client, context)
     }
 
     throw new SatoraInvalidOptionsError(
-      `unsupported swidge direction ${source.chain ?? '?'} -> ${targetChain}; ` +
+      `unsupported swidge direction ${sourceChain} -> ${targetChain}; ` +
       'implemented: Arkade/Bitcoin/Lightning -> EVM, and EVM -> Arkade/Bitcoin/Lightning'
     )
   }
 
   /** @private */
-  async _swidgeArkadeToEvm (client, account, { target, targetChain, recipient, options }) {
+  async _swidgeArkadeToEvm (client, account, { route, recipient, options }) {
     if (typeof account.sendTransaction !== 'function') {
       throw new SatoraInvalidOptionsError('Arkade -> EVM swidge requires an Arkade wallet account (with sendTransaction)')
     }
-    requireFromAmount(options, 'Arkade -> EVM')
+    const sourceAmount = requireFromAmount(options, 'Arkade -> EVM')
 
     const { response } = await client.createArkadeToEvmSwapGeneric({
       targetAddress: recipient,
-      tokenAddress: target.tokenId,
-      evmChainId: Number(targetChain),
-      sourceAmount: BigInt(options.fromTokenAmount)
+      tokenAddress: route.targetToken,
+      evmChainId: Number(route.targetChain),
+      sourceAmount
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
     // Fund the Arkade VHTLC from the source account.
     const funding = await account.sendTransaction({ to: response.btc_vhtlc_address, value: fromTokenAmount })
@@ -285,28 +402,26 @@ export default class SatoraProtocol extends SwidgeProtocol {
 
     const claimTx = final.evm_claim_txid ?? claim.txHash
     const transactions = [{ hash: funding.hash, chain: 'Arkade', type: 'source' }]
-    if (claimTx) transactions.push({ hash: claimTx, chain: Number(targetChain), type: 'destination' })
+    if (claimTx) transactions.push({ hash: claimTx, chain: Number(route.targetChain), type: 'destination' })
 
-    return { id, hash: claimTx ?? funding.hash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount }
+    return { id, hash: claimTx ?? funding.hash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount, toTokenAmountMin }
   }
 
   /** @private */
-  async _swidgeBitcoinToEvm (client, account, { target, targetChain, recipient, options }) {
+  async _swidgeBitcoinToEvm (client, account, { route, recipient, options }) {
     if (typeof account.sendTransaction !== 'function') {
       throw new SatoraInvalidOptionsError('Bitcoin -> EVM swidge requires a Bitcoin wallet account (with sendTransaction)')
     }
-    requireFromAmount(options, 'Bitcoin -> EVM')
+    const sourceAmount = requireFromAmount(options, 'Bitcoin -> EVM')
 
     const { response } = await client.createBitcoinToEvmSwap({
       targetAddress: recipient,
-      tokenAddress: target.tokenId,
-      evmChainId: Number(targetChain),
-      sourceAmount: Number(options.fromTokenAmount)
+      tokenAddress: route.targetToken,
+      evmChainId: Number(route.targetChain),
+      sourceAmount: toSafeNumber(sourceAmount, 'fromTokenAmount')
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
     // Fund the on-chain Bitcoin HTLC from the source account.
     const funding = await account.sendTransaction({ to: response.btc_htlc_address, value: fromTokenAmount })
@@ -315,28 +430,26 @@ export default class SatoraProtocol extends SwidgeProtocol {
 
     const claimTx = final.evm_claim_txid ?? claim.txHash
     const transactions = [{ hash: funding.hash, chain: 'Bitcoin', type: 'source' }]
-    if (claimTx) transactions.push({ hash: claimTx, chain: Number(targetChain), type: 'destination' })
+    if (claimTx) transactions.push({ hash: claimTx, chain: Number(route.targetChain), type: 'destination' })
 
-    return { id, hash: claimTx ?? funding.hash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount }
+    return { id, hash: claimTx ?? funding.hash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount, toTokenAmountMin }
   }
 
   /** @private */
-  async _swidgeLightningToEvm (client, account, { target, targetChain, recipient, options }) {
-    if (typeof account.payInvoice !== 'function') {
-      throw new SatoraInvalidOptionsError('Lightning -> EVM swidge requires a Lightning wallet account (with payInvoice)')
+  async _swidgeLightningToEvm (client, account, { route, recipient, options }) {
+    if (typeof account.payLightningInvoice !== 'function' && typeof account.payInvoice !== 'function') {
+      throw new SatoraInvalidOptionsError('Lightning -> EVM swidge requires a Lightning wallet account (with payLightningInvoice)')
     }
-    requireFromAmount(options, 'Lightning -> EVM')
+    const sourceAmount = requireFromAmount(options, 'Lightning -> EVM')
 
     const { response } = await client.createLightningToEvmSwap({
       targetAddress: recipient,
-      evmChainId: Number(targetChain),
-      tokenAddress: target.tokenId,
-      sourceAmount: Number(options.fromTokenAmount)
+      evmChainId: Number(route.targetChain),
+      tokenAddress: route.targetToken,
+      sourceAmount: toSafeNumber(sourceAmount, 'fromTokenAmount')
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
     // Pay the hold invoice concurrently with completion: the invoice only
     // settles once the swap reveals the preimage (during claim), so awaiting it
@@ -344,112 +457,101 @@ export default class SatoraProtocol extends SwidgeProtocol {
     // also surfaces a payment failure (e.g. insufficient funds) promptly instead
     // of letting _completeSwap poll until it times out.
     const payment = Promise.resolve()
-      .then(() => account.payInvoice(response.bolt11_invoice))
+      .then(() => payLightningInvoice(account, response.bolt11_invoice, this._config.lightningMaxFeeSats))
       .catch(err => { throw new Error(`lightning payment failed: ${err?.message ?? err}`) })
 
     const [{ swap: final, claim }] = await Promise.all([this._completeSwap(client, id), payment])
 
     const claimTx = final.evm_claim_txid ?? claim.txHash
     const transactions = []
-    if (claimTx) transactions.push({ hash: claimTx, chain: Number(targetChain), type: 'destination' })
+    if (claimTx) transactions.push({ hash: claimTx, chain: Number(route.targetChain), type: 'destination' })
 
-    return { id, hash: claimTx, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount }
+    return { id, hash: claimTx, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount, toTokenAmountMin }
   }
 
   /** @private */
-  async _swidgeEvmToArkade (client, account, { source, recipient, options }) {
-    if (!account.address) {
-      throw new SatoraInvalidOptionsError('EVM -> Arkade swidge requires an EvmSigner account (with .address)')
-    }
-    requireFromAmount(options, 'EVM -> Arkade')
+  async _swidgeEvmToArkade (client, { route, recipient, options }) {
+    const sourceAmount = requireFromAmount(options, 'EVM -> Arkade')
+    const signer = await this._getEvmSigner(route.sourceChain)
 
     const { response } = await client.createEvmToArkadeSwapGeneric({
       targetAddress: recipient,
-      tokenAddress: source.tokenId,
-      evmChainId: Number(source.chain),
-      userAddress: account.address,
-      sourceAmount: BigInt(options.fromTokenAmount)
+      tokenAddress: route.sourceToken,
+      evmChainId: Number(route.sourceChain),
+      userAddress: signer.address,
+      sourceAmount
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
-    // Fund the EVM HTLC from the EvmSigner (token approval + deposit).
-    const { txHash } = await client.fundSwap(id, account)
+    // Fund the EVM HTLC with the account (token approval + deposit).
+    const { txHash } = await client.fundSwap(id, signer)
 
     const { swap: final } = await this._completeSwap(client, id)
 
     const claimTx = final.btc_claim_txid
-    const transactions = [{ hash: txHash, chain: Number(source.chain), type: 'source' }]
+    const transactions = [{ hash: txHash, chain: Number(route.sourceChain), type: 'source' }]
     if (claimTx) transactions.push({ hash: claimTx, chain: 'Arkade', type: 'destination' })
 
-    return { id, hash: claimTx ?? txHash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount }
+    return { id, hash: claimTx ?? txHash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount, toTokenAmountMin }
   }
 
   /** @private */
-  async _swidgeEvmToBitcoin (client, account, { source, recipient, options }) {
-    if (!account.address) {
-      throw new SatoraInvalidOptionsError('EVM -> Bitcoin swidge requires an EvmSigner account (with .address)')
-    }
-    requireFromAmount(options, 'EVM -> Bitcoin')
+  async _swidgeEvmToBitcoin (client, { route, recipient, options }) {
+    const sourceAmount = requireFromAmount(options, 'EVM -> Bitcoin')
+    const signer = await this._getEvmSigner(route.sourceChain)
 
     const { response } = await client.createEvmToBitcoinSwap({
       targetAddress: recipient,
-      tokenAddress: source.tokenId,
-      evmChainId: Number(source.chain),
-      userAddress: account.address,
-      sourceAmount: BigInt(options.fromTokenAmount)
+      tokenAddress: route.sourceToken,
+      evmChainId: Number(route.sourceChain),
+      userAddress: signer.address,
+      sourceAmount
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
     // Fund the EVM HTLC, then claim the BTC HTLC on-chain to the recipient.
-    const { txHash } = await client.fundSwap(id, account)
+    const { txHash } = await client.fundSwap(id, signer)
     const { swap: final, claim } = await this._completeSwap(
       client, id, { timeoutMs: BTC_ONCHAIN_TIMEOUT_MS },
       { destinationAddress: recipient, feeRateSatPerVb: this._config.feeRateSatPerVb }
     )
 
     const claimTx = final.btc_claim_txid ?? claim.txHash
-    const transactions = [{ hash: txHash, chain: Number(source.chain), type: 'source' }]
+    const transactions = [{ hash: txHash, chain: Number(route.sourceChain), type: 'source' }]
     if (claimTx) transactions.push({ hash: claimTx, chain: 'Bitcoin', type: 'destination' })
 
-    return { id, hash: claimTx ?? txHash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount }
+    return { id, hash: claimTx ?? txHash, fees: swapFee(response.fee_sats), transactions, fromTokenAmount, toTokenAmount, toTokenAmountMin }
   }
 
   /** @private */
-  async _swidgeEvmToLightning (client, account, { source, recipient, options }) {
-    if (!account.address) {
-      throw new SatoraInvalidOptionsError('EVM -> Lightning swidge requires an EvmSigner account (with .address)')
-    }
+  async _swidgeEvmToLightning (client, { route, recipient, options }) {
+    const signer = await this._getEvmSigner(route.sourceChain)
 
     const { response } = await client.createEvmToLightningSwap({
-      evmChainId: Number(source.chain),
-      tokenAddress: source.tokenId,
-      userAddress: account.address,
+      evmChainId: Number(route.sourceChain),
+      tokenAddress: route.sourceToken,
+      userAddress: signer.address,
       ...lightningDestination(recipient, options)
     })
 
-    const id = response.id
-    const fromTokenAmount = BigInt(response.source_amount)
-    const toTokenAmount = BigInt(response.target_amount)
+    const { id, fromTokenAmount, toTokenAmount, toTokenAmountMin } = acceptSwap(response, options)
 
-    // Fund the EVM HTLC from the EvmSigner. The server then pays the Lightning
+    // Fund the EVM HTLC with the account. The server then pays the Lightning
     // invoice and claims the EVM HTLC — there is no client claim, so just wait
     // for the swap to settle.
-    const { txHash } = await client.fundSwap(id, account)
+    const { txHash } = await client.fundSwap(id, signer)
     await this._waitForSwapStatus(client, id, TERMINAL_SUCCESS_STATES, TERMINAL_FAIL_STATES)
 
     return {
       id,
       hash: txHash,
       fees: swapFee(response.fee_sats),
-      transactions: [{ hash: txHash, chain: Number(source.chain), type: 'source' }],
+      transactions: [{ hash: txHash, chain: Number(route.sourceChain), type: 'source' }],
       fromTokenAmount,
-      toTokenAmount
+      toTokenAmount,
+      toTokenAmountMin
     }
   }
 
@@ -511,17 +613,17 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * expired or was refunded).
    *
    * This is a recovery operation for a swap interrupted after {@link swidge}
-   * created and funded it (e.g. the process died mid-flight). It is driven by
-   * the swap client's persisted secret (mnemonic + storage); no account is
-   * needed, since the claim goes to the recipient recorded on the swap.
+   * created and funded it (e.g. the process died mid-flight). It needs the
+   * same account (the swap key is derived from it) and the same storage.
    *
    * @param {string} id - The swap id.
    * @param {{ timeoutMs?: number, intervalMs?: number }} [options] - Polling overrides.
    * @returns {Promise<SwidgeStatusResult & { id: string }>} The 'completed' status and transactions.
+   * @throws {import('./errors.js').SatoraInvalidOptionsError} If no account is bound.
    * @throws {Error} If the swap cannot be completed.
    */
   async resumeSwidge (id, options = {}) {
-    const client = await this._getClient()
+    const client = await this._getSigningClient()
 
     const waitOpts = {}
     if (options.timeoutMs !== undefined) waitOpts.timeoutMs = options.timeoutMs
@@ -549,10 +651,10 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * Use this when {@link resumeSwidge} throws. The mechanism depends on the swap
    * direction:
    * - **EVM source** (EVM -> Arkade/Bitcoin/Lightning): reclaims the EVM HTLC
-   *   with the account's {@link EvmSigner}. Collaborative (gasless, no timelock
-   *   wait) by default; pass `options.manual` for the timelock-based refund.
-   *   The refund pays out the BTC-pegged HTLC token (tBTC/WBTC) to the
-   *   depositor.
+   *   with the account. Collaborative (gasless, no timelock wait) by default,
+   *   which needs an EOA signature; pass `options.manual` for the timelock-based
+   *   refund (works for any account, including ERC-4337 smart accounts). The
+   *   refund pays out the BTC-pegged HTLC token (tBTC/WBTC) to the depositor.
    * - **Arkade/Bitcoin source**: reclaims to the account's address via the
    *   satora refund (`options` are forwarded, e.g. an on-chain `feeRateSatPerVb`).
    * - **Lightning source**: cannot be refunded — the unpaid invoice expires.
@@ -569,22 +671,21 @@ export default class SatoraProtocol extends SwidgeProtocol {
       throw new SatoraInvalidOptionsError('refund requires a wallet account')
     }
 
-    const client = await this._getClient()
+    const client = await this._getSigningClient()
     const swap = await client.getSwap(id, { updateStorage: true })
     const direction = swap.direction ?? ''
 
-    // EVM-sourced: reclaim the EVM HTLC with the user's signer.
+    // EVM-sourced: reclaim the EVM HTLC with the account.
     if (direction.startsWith('evm_to_')) {
-      if (!account.address) {
-        throw new SatoraInvalidOptionsError('refund of an EVM-sourced swap requires an EvmSigner account (with .address)')
-      }
+      const chainId = swap.evm_chain_id
+      const signer = await this._getEvmSigner(String(chainId ?? await this._resolveSourceChain(undefined)))
       const { txHash } = options.manual
-        ? await client.refundEvmWithSigner(id, account)
-        : await client.collabRefundEvmWithSigner(id, account)
+        ? await client.refundEvmWithSigner(id, signer)
+        : await client.collabRefundEvmWithSigner(id, signer)
 
       const after = await client.getSwap(id, { updateStorage: true })
       const transactions = toSwidgeTransactions(after)
-      transactions.push({ hash: txHash, chain: after.evm_chain_id ?? swap.evm_chain_id, type: 'refund' })
+      transactions.push({ hash: txHash, chain: after.evm_chain_id ?? chainId, type: 'refund' })
       return { id, status: 'refunded', transactions, message: 'evm refund submitted' }
     }
 
@@ -634,6 +735,8 @@ export default class SatoraProtocol extends SwidgeProtocol {
 
   /**
    * Retrieves the tokens supported by the provider for swidge operations.
+   * Each token's `token` is the provider id to pass as `fromToken`/`toToken`
+   * (`btc`, or the ERC-20 contract address); `chain` carries its chain.
    *
    * @param {SwidgeSupportedTokensOptions} [options] - Optional filters for chain- or route-scoped token discovery.
    * @returns {Promise<SwidgeSupportedToken[]>} The supported tokens.
@@ -650,7 +753,7 @@ export default class SatoraProtocol extends SwidgeProtocol {
     // API and is ignored.
     const chainFilter = [options.fromChain, options.toChain]
       .filter(chain => chain !== undefined && chain !== null)
-      .map(chain => String(toChainId(chain)))
+      .map(chain => normalizeChain(chain))
 
     if (chainFilter.length === 0) return tokens
 
@@ -670,8 +773,8 @@ const FEE_CHAIN = 'Bitcoin'
 // slower than Arkade/Lightning, so those directions poll for longer.
 const BTC_ONCHAIN_TIMEOUT_MS = 3600000
 
-// Swap status groupings for driving the Arkade -> EVM flow (satora SwapStatus
-// state machine).
+// Swap status groupings for driving the swap flow (satora SwapStatus state
+// machine).
 const SERVER_FUNDED_STATES = ['serverfunded']
 const FUND_FAIL_STATES = ['expired', 'clientrefunded', 'clientfundedserverrefunded', 'serverwontfund', 'clientfundedtoolate', 'clientinvalidfunded', 'clientredeemedandclientrefunded']
 const TERMINAL_SUCCESS_STATES = ['serverredeemed', 'clientredeemed']
@@ -738,15 +841,78 @@ function toSwidgeTransactions (swap) {
 }
 
 /**
- * Throws unless `fromTokenAmount` (an exact-in source amount) is present.
+ * Reads the created swap's amounts and enforces the caller's `minAmountOut`
+ * guard before anything is funded. A rejected swap is simply left unfunded and
+ * expires on its own.
+ *
+ * @param {{ id: string, source_amount: string | number, target_amount: string | number }} response - The create-swap response.
+ * @param {SwidgeOptions} options - The swidge options.
+ * @returns {{ id: string, fromTokenAmount: bigint, toTokenAmount: bigint, toTokenAmountMin: bigint }} The accepted amounts.
+ * @throws {SatoraMinAmountOutError} If the swap would deliver less than `minAmountOut`.
+ */
+function acceptSwap (response, options) {
+  const id = response.id
+  const fromTokenAmount = BigInt(response.source_amount)
+  const toTokenAmount = BigInt(response.target_amount)
+
+  const minAmountOut = options.minAmountOut !== undefined && options.minAmountOut !== null
+    ? BigInt(options.minAmountOut)
+    : applySlippage(toTokenAmount, options.slippage ?? 0)
+
+  if (toTokenAmount < minAmountOut) {
+    throw new SatoraMinAmountOutError(id, toTokenAmount, minAmountOut)
+  }
+
+  return { id, fromTokenAmount, toTokenAmount, toTokenAmountMin: minAmountOut }
+}
+
+/**
+ * Returns `fromTokenAmount` (an exact-in source amount) as a bigint, throwing
+ * if it is absent.
  *
  * @param {SwidgeOptions} options - The swidge options.
  * @param {string} direction - The direction label, for the error message.
+ * @returns {bigint} The source amount in base units.
  */
 function requireFromAmount (options, direction) {
   if (options.fromTokenAmount === undefined || options.fromTokenAmount === null) {
     throw new SatoraInvalidOptionsError(`${direction} swidge requires fromTokenAmount (exact-in)`)
   }
+  return BigInt(options.fromTokenAmount)
+}
+
+/**
+ * Converts a bigint to a number where the SDK requires one, refusing values
+ * that cannot be represented exactly.
+ *
+ * @param {bigint} value - The value.
+ * @param {string} label - The option name, for the error message.
+ * @returns {number} The number.
+ */
+function toSafeNumber (value, label) {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new SatoraInvalidOptionsError(`${label} ${value} exceeds the safe integer range`)
+  }
+  return Number(value)
+}
+
+/**
+ * Pays a BOLT11 invoice with the Lightning account: a WDK Spark account
+ * (`payLightningInvoice({ invoice, maxFeeSats })`) or any account exposing
+ * `payInvoice(bolt11)`.
+ *
+ * @param {Object} account - The Lightning wallet account.
+ * @param {string} invoice - The BOLT11 invoice.
+ * @param {number} [maxFeeSats] - The maximum routing fee.
+ * @returns {Promise<unknown>} The payment result.
+ */
+function payLightningInvoice (account, invoice, maxFeeSats) {
+  if (typeof account.payLightningInvoice === 'function') {
+    const params = { invoice }
+    if (maxFeeSats !== undefined) params.maxFeeSats = maxFeeSats
+    return account.payLightningInvoice(params)
+  }
+  return account.payInvoice(invoice)
 }
 
 /**
@@ -771,7 +937,7 @@ function lightningDestination (recipient, options) {
       'a lightning address / LNURL destination requires the payout amount in sats (toTokenAmount)'
     )
   }
-  const targetAmountSats = Number(options.toTokenAmount)
+  const targetAmountSats = toSafeNumber(BigInt(options.toTokenAmount), 'toTokenAmount')
 
   if (/^lnurl/i.test(recipient)) return { lnurl: recipient, targetAmountSats }
   return { lightningAddress: recipient, targetAmountSats }
@@ -803,16 +969,6 @@ function swapFee (feeSats) {
  */
 function sleep (ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-/**
- * Returns true if the chain identifier is an EVM chain (a numeric id).
- *
- * @param {string | number} chain - The chain identifier.
- * @returns {boolean}
- */
-function isEvmChain (chain) {
-  return Number.isInteger(Number(chain))
 }
 
 /**

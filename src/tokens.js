@@ -18,42 +18,30 @@ import { toChainId } from './chains.js'
 
 /** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedToken} SwidgeSupportedToken */
 
-// Satora's `token_id` alone is ambiguous: 'btc' is the identifier for BTC on
-// Bitcoin, Lightning, AND Arkade. So the WDK token identifier is chain-qualified
-// as `chain:tokenId` (e.g. '137:0x...', 'Bitcoin:btc', 'Lightning:btc'), which
-// carries the chain through the standard fromToken/toToken options.
 const SEPARATOR = ':'
 
 /**
- * Builds a chain-qualified WDK token identifier.
+ * Splits a token identifier into its parts. The WDK convention is a bare
+ * token id — an ERC-20 contract address, or `btc` — with the chain coming from
+ * the account (source) or `toChain` (destination). A chain-qualified form
+ * (`chain:tokenId`, e.g. `42161:0x...` or `Lightning:btc`) is also accepted
+ * and yields `chain`; otherwise `chain` is undefined.
  *
- * @param {string | number} chain - The satora chain identifier.
- * @param {string} tokenId - The satora token id ('btc' or a contract address).
- * @returns {string} The `chain:tokenId` identifier.
- */
-export function composeTokenId (chain, tokenId) {
-  return `${chain}${SEPARATOR}${tokenId}`
-}
-
-/**
- * Splits a chain-qualified WDK token identifier into its parts. If the
- * identifier is not chain-qualified, `chain` is undefined.
- *
- * @param {string} token - The token identifier (`chain:tokenId` or `tokenId`).
+ * @param {string} token - The token identifier (`tokenId` or `chain:tokenId`).
  * @returns {{ chain: string | undefined, tokenId: string }} The parts.
  */
 export function parseTokenId (token) {
-  const value = String(token)
+  const value = String(token).trim()
   const index = value.indexOf(SEPARATOR)
   if (index === -1) return { chain: undefined, tokenId: value }
   return { chain: value.slice(0, index), tokenId: value.slice(index + 1) }
 }
 
 /**
- * Maps a satora `TokenInfo` to a WDK {@link SwidgeSupportedToken}. The `token`
- * identifier is chain-qualified (`chain:tokenId`) so it can be passed straight
- * back as `fromToken`/`toToken`. For EVM tokens the contract address is also
- * surfaced as `address`.
+ * Maps a satora `TokenInfo` to a WDK {@link SwidgeSupportedToken}. `token` is
+ * the bare provider token id (`btc`, or the ERC-20 contract address), which can
+ * be passed straight back as `fromToken`/`toToken`; the chain is carried by
+ * `chain`. For EVM tokens the contract address is also surfaced as `address`.
  *
  * @param {Object} info - The satora token info.
  * @param {string} info.token_id - The provider-specific token identifier.
@@ -67,7 +55,7 @@ export function toSupportedToken (info) {
   const isEvmAddress = typeof info.token_id === 'string' && info.token_id.startsWith('0x')
 
   const token = {
-    token: composeTokenId(info.chain, info.token_id),
+    token: info.token_id,
     chain: toChainId(info.chain),
     symbol: info.symbol,
     decimals: info.decimals,

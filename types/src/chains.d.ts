@@ -11,6 +11,24 @@ export type SwidgeSupportedChain = import('@tetherto/wdk-wallet/protocols').Swid
  */
 export declare const CHAIN_METADATA: Record<string, SwidgeSupportedChain>;
 /**
+ * Normalizes a caller-supplied chain reference to the satora `Chain`
+ * identifier: EVM chains become their numeric id as a string ('42161'), the
+ * Bitcoin-family chains their canonical name ('Bitcoin', 'Arkade',
+ * 'Lightning'). Accepts numbers, numeric strings and case-insensitive names.
+ *
+ * @param {string | number} chain - The chain reference.
+ * @returns {string} The satora chain identifier.
+ * @throws {SatoraInvalidOptionsError} If the chain is not recognised.
+ */
+export declare function normalizeChain(chain: string | number): string;
+/**
+ * Returns true if the chain identifier is an EVM chain (a numeric id).
+ *
+ * @param {string | number} chain - The chain identifier.
+ * @returns {boolean}
+ */
+export declare function isEvmChain(chain: string | number): boolean;
+/**
  * Normalizes a satora `Chain` identifier to the WDK chain id form: EVM chains
  * (encoded as numeric strings) become numbers, non-EVM chains stay as their
  * name. This is the canonical id surfaced by {@link toSupportedChain} and used

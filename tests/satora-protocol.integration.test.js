@@ -75,8 +75,8 @@ describe('SatoraProtocol (integration)', { skip }, () => {
         }
       }
 
-      // Token ids are chain-qualified; BTC on Bitcoin must be discoverable.
-      assert.ok(tokens.some(t => t.token === 'Bitcoin:btc'), 'Bitcoin:btc is supported')
+      // Token ids are provider ids with the chain alongside; BTC on Bitcoin must be discoverable.
+      assert.ok(tokens.some(t => t.token === 'btc' && t.chain === 'Bitcoin'), 'btc on Bitcoin is supported')
     })
 
     it('filters tokens by chain', async () => {
@@ -93,12 +93,13 @@ describe('SatoraProtocol (integration)', { skip }, () => {
   })
 
   describe('quoteSwidge', () => {
-    it('quotes an exact-in Bitcoin -> Arbitrum USDT0 swap using chain-qualified tokens', async () => {
-      const protocol = new SatoraProtocol(undefined, config)
+    it('quotes an exact-in Bitcoin -> Arbitrum USDT0 swap (source chain from config, destination from toChain)', async () => {
+      const protocol = new SatoraProtocol(undefined, { ...config, chain: 'Bitcoin' })
 
       const quote = await protocol.quoteSwidge({
-        fromToken: 'Bitcoin:btc',
-        toToken: '42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT0 on Arbitrum
+        fromToken: 'btc',
+        toToken: '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT0
+        toChain: 42161, // Arbitrum
         fromTokenAmount: 100000n // 0.001 BTC in sats
       })
 

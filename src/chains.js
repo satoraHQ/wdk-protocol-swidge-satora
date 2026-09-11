@@ -14,6 +14,8 @@
 
 'use strict'
 
+import { SatoraInvalidOptionsError } from './errors.js'
+
 /** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedChain} SwidgeSupportedChain */
 
 /**
@@ -32,6 +34,40 @@ export const CHAIN_METADATA = {
   1: { id: 1, name: 'Ethereum', type: 'evm', nativeToken: 'ETH' },
   137: { id: 137, name: 'Polygon', type: 'evm', nativeToken: 'POL' },
   42161: { id: 42161, name: 'Arbitrum', type: 'evm', nativeToken: 'ETH' }
+}
+
+const NAMED_CHAINS = { bitcoin: 'Bitcoin', btc: 'Bitcoin', lightning: 'Lightning', arkade: 'Arkade' }
+
+/**
+ * Normalizes a caller-supplied chain reference to the satora `Chain`
+ * identifier: EVM chains become their numeric id as a string ('42161'), the
+ * Bitcoin-family chains their canonical name ('Bitcoin', 'Arkade',
+ * 'Lightning'). Accepts numbers, numeric strings and case-insensitive names.
+ *
+ * @param {string | number} chain - The chain reference.
+ * @returns {string} The satora chain identifier.
+ * @throws {SatoraInvalidOptionsError} If the chain is not recognised.
+ */
+export function normalizeChain (chain) {
+  const text = String(chain).trim()
+  if (text !== '' && Number.isInteger(Number(text))) return String(Number(text))
+
+  const named = NAMED_CHAINS[text.toLowerCase()]
+  if (named) return named
+
+  throw new SatoraInvalidOptionsError(
+    `unknown chain "${chain}"; expected an EVM chain id (e.g. 42161) or "Bitcoin", "Arkade", "Lightning"`
+  )
+}
+
+/**
+ * Returns true if the chain identifier is an EVM chain (a numeric id).
+ *
+ * @param {string | number} chain - The chain identifier.
+ * @returns {boolean}
+ */
+export function isEvmChain (chain) {
+  return Number.isInteger(Number(chain))
 }
 
 /**
