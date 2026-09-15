@@ -173,11 +173,9 @@ await satora.refundSwidge(result.id)    // direction-aware
 
 `refundSwidge` dispatches on the swap direction:
 
-- **EVM source** — reclaims the EVM HTLC with the account, collaborative and
-  gasless by default (the account signs an EIP-712 message; needs an EOA
-  signature), or `{ manual: true }` for the timelock refund the account sends
-  itself (works with ERC-4337 smart accounts too). Pays out the BTC-pegged
-  HTLC token (tBTC/WBTC).
+- **EVM source** — the account sends the timelock refund itself once the
+  HTLC's refund timelock has passed (any account that can send a transaction,
+  ERC-4337 included). Pays out the BTC-pegged HTLC token (tBTC/WBTC).
 - **Arkade / Bitcoin source** — reclaims to the account's address.
 - **Lightning source** — throws; the unpaid invoice simply expires.
 

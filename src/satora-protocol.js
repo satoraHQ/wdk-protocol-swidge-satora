@@ -59,8 +59,11 @@ import { detectEvmChainId, toEvmSigner } from './evm-signer.js'
  */
 
 /**
- * @typedef {Object} SatoraRefundOptions
- * @property {boolean} [manual] - For an EVM-sourced swap: use the timelock-based refund (the account pays gas) instead of the gasless collaborative one. Ignored for Arkade/Bitcoin sources, whose other fields are forwarded as {@link RefundOptions}.
+ * Refund options. Ignored for EVM sources (the account sends the timelock
+ * refund itself); forwarded as {@link RefundOptions} for Arkade/Bitcoin
+ * sources (e.g. an on-chain `feeRateSatPerVb`).
+ *
+ * @typedef {RefundOptions} SatoraRefundOptions
  */
 
 /**
@@ -650,17 +653,17 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * Refunds a swap that can no longer complete, reclaiming the source funds.
    * Use this when {@link resumeSwidge} throws. The mechanism depends on the swap
    * direction:
-   * - **EVM source** (EVM -> Arkade/Bitcoin/Lightning): reclaims the EVM HTLC
-   *   with the account. Collaborative (gasless, no timelock wait) by default,
-   *   which needs an EOA signature; pass `options.manual` for the timelock-based
-   *   refund (works for any account, including ERC-4337 smart accounts). The
-   *   refund pays out the BTC-pegged HTLC token (tBTC/WBTC) to the depositor.
+   * - **EVM source** (EVM -> Arkade/Bitcoin/Lightning): the account sends the
+   *   timelock refund transaction itself (it pays gas), so this only succeeds
+   *   once the HTLC's refund timelock has passed. Works for any account that can
+   *   send a transaction, including ERC-4337 smart accounts. The refund pays out
+   *   the BTC-pegged HTLC token (tBTC/WBTC) to the depositor.
    * - **Arkade/Bitcoin source**: reclaims to the account's address via the
    *   satora refund (`options` are forwarded, e.g. an on-chain `feeRateSatPerVb`).
    * - **Lightning source**: cannot be refunded — the unpaid invoice expires.
    *
    * @param {string} id - The swap id.
-   * @param {SatoraRefundOptions} [options] - Refund options (`manual` for EVM sources; SDK {@link RefundOptions} fields are forwarded for Arkade/Bitcoin sources).
+   * @param {SatoraRefundOptions} [options] - Refund options, forwarded for Arkade/Bitcoin sources; ignored for EVM sources.
    * @returns {Promise<SwidgeStatusResult & { id: string, message?: string }>} The 'refunded' status and transactions.
    * @throws {import('./errors.js').SatoraInvalidOptionsError} If no (suitable) account is bound, or the direction cannot be refunded.
    * @throws {Error} If the swap cannot be refunded.
@@ -675,13 +678,11 @@ export default class SatoraProtocol extends SwidgeProtocol {
     const swap = await client.getSwap(id, { updateStorage: true })
     const direction = swap.direction ?? ''
 
-    // EVM-sourced: reclaim the EVM HTLC with the account.
+    // EVM-sourced: the account sends the timelock refund itself.
     if (direction.startsWith('evm_to_')) {
       const chainId = swap.evm_chain_id
       const signer = await this._getEvmSigner(String(chainId ?? await this._resolveSourceChain(undefined)))
-      const { txHash } = options.manual
-        ? await client.refundEvmWithSigner(id, signer)
-        : await client.collabRefundEvmWithSigner(id, signer)
+      const { txHash } = await client.refundEvmWithSigner(id, signer)
 
       const after = await client.getSwap(id, { updateStorage: true })
       const transactions = toSwidgeTransactions(after)
