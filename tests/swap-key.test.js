@@ -1,6 +1,6 @@
 import { jest, describe, test, expect } from '@jest/globals'
 
-import { deriveSwapXprv } from '../src/swap-key.js'
+import { canDeriveSwapKey, deriveSwapXprv } from '../src/swap-key.js'
 import { SatoraInvalidOptionsError } from '../src/errors.js'
 
 const KEY = new Uint8Array(32).fill(9)
@@ -46,5 +46,14 @@ describe('deriveSwapXprv', () => {
   test('throws for an account with no usable key material', async () => {
     await expect(deriveSwapXprv({ getAddress: async () => 'x' })).rejects.toThrow(SatoraInvalidOptionsError)
     await expect(deriveSwapXprv({ keyPair: { privateKey: null } })).rejects.toThrow(SatoraInvalidOptionsError)
+  })
+
+  test('canDeriveSwapKey mirrors the supported key material', () => {
+    expect(canDeriveSwapKey({ keyPair: { privateKey: KEY } })).toBe(true)
+    expect(canDeriveSwapKey({ sign: async () => '0x' })).toBe(true)
+    expect(canDeriveSwapKey({ signTypedData: async () => '0x' })).toBe(true)
+    expect(canDeriveSwapKey({ get keyPair () { throw new Error('nope') }, getAddress: async () => 'x' })).toBe(false)
+    expect(canDeriveSwapKey({ payLightningInvoice: async () => {} })).toBe(false)
+    expect(canDeriveSwapKey(undefined)).toBe(false)
   })
 })

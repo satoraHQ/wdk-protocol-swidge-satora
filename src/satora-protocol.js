@@ -20,7 +20,8 @@ import { Client } from '@satora/swap'
 import { isEvmChain, normalizeChain, toSupportedChain } from './chains.js'
 import { parseTokenId, toSupportedToken } from './tokens.js'
 import { SatoraInvalidOptionsError, SatoraMinAmountOutError } from './errors.js'
-import { deriveSwapXprv } from './swap-key.js'
+import { canDeriveSwapKey, deriveSwapXprv } from './swap-key.js'
+import { SwapKeyIndexStorage } from './key-index-storage.js'
 import { detectEvmChainId, toEvmSigner } from './evm-signer.js'
 
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccount} IWalletAccount */
@@ -38,7 +39,6 @@ import { detectEvmChainId, toEvmSigner } from './evm-signer.js'
 
 /** @typedef {import('@satora/swap').Client} SatoraClient */
 /** @typedef {import('@satora/swap').EvmSigner} EvmSigner */
-/** @typedef {import('@satora/swap').WalletStorage} WalletStorage */
 /** @typedef {import('@satora/swap').SwapStorage} SwapStorage */
 /** @typedef {import('@satora/swap').GetSwapResponse} GetSwapResponse */
 /** @typedef {import('@satora/swap').RefundOptions} RefundOptions */
@@ -51,8 +51,7 @@ import { detectEvmChainId, toEvmSigner } from './evm-signer.js'
  * @property {number} [defaultSlippage] - The default slippage tolerance as a decimal (e.g., 0.01 for 1%).
  * @property {number} [feeRateSatPerVb] - Fee rate (sat/vB) for the on-chain Bitcoin claim of an EVM -> Bitcoin swap. Defaults to the SDK's default.
  * @property {number} [lightningMaxFeeSats] - Maximum routing fee (sats) a Lightning account may pay for the swap invoice.
- * @property {WalletStorage} [signerStorage] - Persists the swap client's key index. Recommended for fund-moving operations so an interrupted swap survives a restart.
- * @property {SwapStorage} [swapStorage] - Persists per-swap state (the preimage, keys, last response) for recovery/refund.
+ * @property {SwapStorage} [swapStorage] - Persists per-swap state (keys, preimage, last response) for recovery/refund, and thereby the next swap key index. Required for fund-moving operations.
  * @property {string} [baseUrl] - Override the satora API base URL. Defaults to the SDK's production endpoint.
  * @property {string} [arkadeServerUrl] - Override the Arkade server URL.
  * @property {string} [esploraUrl] - Override the Esplora (Bitcoin) API URL.
@@ -127,21 +126,27 @@ export default class SatoraProtocol extends SwidgeProtocol {
   }
 
   /**
-   * Lazily constructs (and memoizes) a read-only satora swap client, used for
-   * discovery, quotes and status lookups.
+   * Lazily constructs (and memoizes) the satora swap client. With a wallet
+   * account that can derive the swap key this is the signing client (see
+   * {@link _getSigningClient}); otherwise (no account, or a read-only one) it
+   * is a read-only client for discovery, quotes and status lookups.
    *
    * @protected
    * @returns {Promise<SatoraClient>} The satora swap client.
    */
   async _getClient () {
+    if (this._account && canDeriveSwapKey(this._account)) return this._getSigningClient()
     if (!this._clientPromise) this._clientPromise = this._buildClient()
     return this._clientPromise
   }
 
   /**
-   * Lazily constructs (and memoizes) the signing satora swap client, whose key
-   * material (HTLC preimage + claim/refund keys) is derived from the wallet
-   * account. Required by every fund-moving operation.
+   * Lazily constructs (and memoizes) the signing satora swap client. Its key
+   * material (HTLC preimage + claim/refund keys) is derived deterministically
+   * from the wallet account on every run and never persisted; the per-swap
+   * key index is tracked through the swap storage. When the swap storage is
+   * empty the server is asked (best effort) to recover this wallet's swaps, so
+   * a fresh device continues where the previous one left off.
    *
    * @protected
    * @returns {Promise<SatoraClient>} The satora swap client.
@@ -152,7 +157,19 @@ export default class SatoraProtocol extends SwidgeProtocol {
       throw new SatoraInvalidOptionsError('this operation requires a wallet account')
     }
     if (!this._signingClientPromise) {
-      this._signingClientPromise = deriveSwapXprv(this._account).then(xprv => this._buildClient(xprv))
+      this._signingClientPromise = (async () => {
+        const client = await this._buildClient(await deriveSwapXprv(this._account))
+        const swapStorage = this._config.swapStorage
+        if (swapStorage && (await swapStorage.list()).length === 0) {
+          try {
+            await client.recoverSwaps()
+          } catch {
+            // Offline or no prior swaps: the server's hash-collision check
+            // still guards against reusing an index.
+          }
+        }
+        return client
+      })()
     }
     return this._signingClientPromise
   }
@@ -160,12 +177,11 @@ export default class SatoraProtocol extends SwidgeProtocol {
   /**
    * Builds a satora swap client.
    *
-   * With `xprv` (the signing client) the key is used ephemerally and
-   * `signerStorage` only persists the swap key index. Without it (the
-   * read-only client) the SDK still generates a throwaway mnemonic
-   * internally — and would persist it if it saw a signer storage — so signer
-   * storage is deliberately withheld: the key stays in memory and is never
-   * used, since read-only operations do not sign anything.
+   * With `xprv` (the signing client) the wallet-derived key is passed to the
+   * SDK ephemerally and the SDK's signer storage is a {@link SwapKeyIndexStorage}
+   * that only tracks the key index, on top of the swap storage. Without it
+   * (no wallet account) the SDK generates a throwaway in-memory key that is
+   * never used, since read-only operations do not sign anything.
    *
    * @private
    * @param {string} [xprv] - The swap client's key material; omitted for the read-only client.
@@ -178,10 +194,24 @@ export default class SatoraProtocol extends SwidgeProtocol {
     if (this._config.esploraUrl) builder = builder.withEsploraUrl(this._config.esploraUrl)
     if (this._config.swapStorage) builder = builder.withSwapStorage(this._config.swapStorage)
     if (xprv) {
-      builder = builder.withXprv(xprv)
-      if (this._config.signerStorage) builder = builder.withSignerStorage(this._config.signerStorage)
+      builder = builder
+        .withXprv(xprv)
+        .withSignerStorage(new SwapKeyIndexStorage(this._config.swapStorage))
     }
     return builder.build()
+  }
+
+  /**
+   * @private
+   * @param {string} operation - The operation name, for the error message.
+   * @throws {SatoraInvalidOptionsError} If no swap storage is configured.
+   */
+  _requireSwapStorage (operation) {
+    if (!this._config.swapStorage) {
+      throw new SatoraInvalidOptionsError(
+        `${operation} requires config.swapStorage: the swap key is derived from the account, so the per-swap key index must persist across runs`
+      )
+    }
   }
 
   /**
@@ -354,6 +384,7 @@ export default class SatoraProtocol extends SwidgeProtocol {
     if (!account) {
       throw new SatoraInvalidOptionsError('swidge requires a wallet account to fund the swap')
     }
+    this._requireSwapStorage('swidge')
 
     const route = await this._resolveRoute(options)
 
@@ -628,7 +659,8 @@ export default class SatoraProtocol extends SwidgeProtocol {
    *
    * This is a recovery operation for a swap interrupted after {@link swidge}
    * created and funded it (e.g. the process died mid-flight). It needs the
-   * same account (the swap key is derived from it) and the same storage.
+   * same account (the swap key is derived from it) and the swap storage —
+   * or, on a new device, an empty swap storage that is seeded from the server.
    *
    * @param {string} id - The swap id.
    * @param {{ timeoutMs?: number, intervalMs?: number }} [options] - Polling overrides.
@@ -637,6 +669,7 @@ export default class SatoraProtocol extends SwidgeProtocol {
    * @throws {Error} If the swap cannot be completed.
    */
   async resumeSwidge (id, options = {}) {
+    this._requireSwapStorage('resumeSwidge')
     const client = await this._getSigningClient()
 
     const waitOpts = {}
@@ -684,6 +717,7 @@ export default class SatoraProtocol extends SwidgeProtocol {
     if (!account) {
       throw new SatoraInvalidOptionsError('refund requires a wallet account')
     }
+    this._requireSwapStorage('refundSwidge')
 
     const client = await this._getSigningClient()
     const swap = await client.getSwap(id, { updateStorage: true })
