@@ -157,9 +157,8 @@ Commands:
                       --fee-rate <sat/vB>     on-chain Bitcoin claim fee rate (Bitcoin only; or SATORA_BTC_FEE_RATE)
   status <swap-id>  Show the status of a swap by id
   resume <swap-id>  Drive an interrupted swap to completion (throws if it cannot)
-  refund <swap-id>  Reclaim an EVM-sourced swap that cannot complete
+  refund <swap-id>  Reclaim an EVM-sourced swap that cannot complete (timelock refund; needs gas)
                       --chain <id>            EVM chain (default 42161)
-                      --manual                timelock refund (default: gasless collaborative)
 
 The EVM wallet needs the source token plus a little native gas.
 Config comes from examples/.env (copy from examples/.env.example).`)
@@ -237,7 +236,7 @@ async function main () {
       printResult(await protocol.resumeSwidge(swapId))
     } else {
       console.log(`Refunding swap ${swapId} to ${address} ...`)
-      printResult(await protocol.refundSwidge(swapId, { ...(flags.manual ? { manual: true } : {}) }))
+      printResult(await protocol.refundSwidge(swapId))
     }
     process.exit(0)
   }
