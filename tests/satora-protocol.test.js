@@ -16,8 +16,7 @@ const mockClient = {
   getSwap: jest.fn(),
   claim: jest.fn(),
   refundSwap: jest.fn(),
-  refundEvmWithSigner: jest.fn(),
-  collabRefundEvmWithSigner: jest.fn()
+  refundEvmWithSigner: jest.fn()
 }
 
 const builderCalls = { withXprv: jest.fn() }
@@ -803,31 +802,20 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
       await expect(protocol.refundSwidge('swap-1')).rejects.toThrow('too early to refund')
     })
 
-    test('EVM-sourced swap refunds via the collaborative signer path (gasless), signing with the account', async () => {
+    test('EVM-sourced swap refunds via the timelock refund, sent by the account', async () => {
       protocol = new SatoraProtocol(evmAccount())
       mockClient.getSwap.mockResolvedValue({ status: 'expired', direction: 'evm_to_bitcoin', evm_chain_id: 42161 })
-      mockClient.collabRefundEvmWithSigner.mockResolvedValue({ txHash: '0xrefundtx' })
+      mockClient.refundEvmWithSigner.mockResolvedValue({ txHash: '0xrefundtx' })
 
       const result = await protocol.refundSwidge('swap-1')
 
-      const [swapId, signer] = mockClient.collabRefundEvmWithSigner.mock.calls[0]
+      const [swapId, signer] = mockClient.refundEvmWithSigner.mock.calls[0]
       expect(swapId).toBe('swap-1')
       expect(signer.address).toBe('0xEvmAccount')
       expect(signer.chainId).toBe(42161)
       expect(mockClient.refundSwap).not.toHaveBeenCalled()
       expect(result.status).toBe('refunded')
       expect(result.transactions).toContainEqual({ hash: '0xrefundtx', chain: 42161, type: 'refund' })
-    })
-
-    test('EVM-sourced refund honours options.manual (timelock refund)', async () => {
-      protocol = new SatoraProtocol(evmAccount())
-      mockClient.getSwap.mockResolvedValue({ status: 'expired', direction: 'evm_to_arkade', evm_chain_id: 42161 })
-      mockClient.refundEvmWithSigner.mockResolvedValue({ txHash: '0xrefundtx' })
-
-      await protocol.refundSwidge('swap-1', { manual: true })
-
-      expect(mockClient.refundEvmWithSigner.mock.calls[0][0]).toBe('swap-1')
-      expect(mockClient.collabRefundEvmWithSigner).not.toHaveBeenCalled()
     })
 
     test('Lightning-sourced swap cannot be refunded', async () => {
