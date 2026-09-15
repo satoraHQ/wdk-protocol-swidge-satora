@@ -158,8 +158,17 @@ export default class SatoraProtocol extends SwidgeProtocol {
      */
     protected _getSigningClient(): Promise<SatoraClient>;
     /**
+     * Builds a satora swap client.
+     *
+     * With `xprv` (the signing client) the key is used ephemerally and
+     * `signerStorage` only persists the swap key index. Without it (the
+     * read-only client) the SDK still generates a throwaway mnemonic
+     * internally — and would persist it if it saw a signer storage — so signer
+     * storage is deliberately withheld: the key stays in memory and is never
+     * used, since read-only operations do not sign anything.
+     *
      * @private
-     * @param {string} [xprv] - The swap client's key material; omitted for a read-only client.
+     * @param {string} [xprv] - The swap client's key material; omitted for the read-only client.
      * @returns {Promise<SatoraClient>} The satora swap client.
      */
     private _buildClient;

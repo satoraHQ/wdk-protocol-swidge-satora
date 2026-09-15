@@ -158,8 +158,17 @@ export default class SatoraProtocol extends SwidgeProtocol {
   }
 
   /**
+   * Builds a satora swap client.
+   *
+   * With `xprv` (the signing client) the key is used ephemerally and
+   * `signerStorage` only persists the swap key index. Without it (the
+   * read-only client) the SDK still generates a throwaway mnemonic
+   * internally — and would persist it if it saw a signer storage — so signer
+   * storage is deliberately withheld: the key stays in memory and is never
+   * used, since read-only operations do not sign anything.
+   *
    * @private
-   * @param {string} [xprv] - The swap client's key material; omitted for a read-only client.
+   * @param {string} [xprv] - The swap client's key material; omitted for the read-only client.
    * @returns {Promise<SatoraClient>} The satora swap client.
    */
   _buildClient (xprv) {
@@ -167,9 +176,11 @@ export default class SatoraProtocol extends SwidgeProtocol {
     if (this._config.baseUrl) builder = builder.withBaseUrl(this._config.baseUrl)
     if (this._config.arkadeServerUrl) builder = builder.withArkadeServerUrl(this._config.arkadeServerUrl)
     if (this._config.esploraUrl) builder = builder.withEsploraUrl(this._config.esploraUrl)
-    if (this._config.signerStorage) builder = builder.withSignerStorage(this._config.signerStorage)
     if (this._config.swapStorage) builder = builder.withSwapStorage(this._config.swapStorage)
-    if (xprv) builder = builder.withXprv(xprv)
+    if (xprv) {
+      builder = builder.withXprv(xprv)
+      if (this._config.signerStorage) builder = builder.withSignerStorage(this._config.signerStorage)
+    }
     return builder.build()
   }
 

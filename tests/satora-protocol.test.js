@@ -19,7 +19,7 @@ const mockClient = {
   refundEvmWithSigner: jest.fn()
 }
 
-const builderCalls = { withXprv: jest.fn() }
+const builderCalls = { withXprv: jest.fn(), withSignerStorage: jest.fn() }
 
 jest.unstable_mockModule('@satora/swap', () => ({
   Client: {
@@ -28,7 +28,7 @@ jest.unstable_mockModule('@satora/swap', () => ({
         withBaseUrl: () => builder,
         withArkadeServerUrl: () => builder,
         withEsploraUrl: () => builder,
-        withSignerStorage: () => builder,
+        withSignerStorage: (storage) => { builderCalls.withSignerStorage(storage); return builder },
         withSwapStorage: () => builder,
         withXprv: (xprv) => { builderCalls.withXprv(xprv); return builder },
         build: async () => mockClient
@@ -70,6 +70,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
   beforeEach(() => {
     for (const fn of Object.values(mockClient)) fn.mockReset()
     builderCalls.withXprv.mockReset()
+    builderCalls.withSignerStorage.mockReset()
 
     // Discovery methods do not require an account.
     protocol = new SatoraProtocol()
@@ -139,6 +140,16 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         targetAmount: 40000n
       })
       expect(quote.toTokenAmount).toBe(40000n)
+    })
+
+    test('the read-only client never touches signer storage (the SDK would persist a throwaway mnemonic)', async () => {
+      const signerStorage = { getMnemonic: jest.fn(), setMnemonic: jest.fn() }
+      protocol = new SatoraProtocol(evmAccount(), { signerStorage })
+
+      await protocol.quoteSwidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 10n })
+
+      expect(builderCalls.withXprv).not.toHaveBeenCalled()
+      expect(builderCalls.withSignerStorage).not.toHaveBeenCalled()
     })
 
     test('derives the source chain from a WDK EVM account (eth_chainId) when config.chain is not set', async () => {
@@ -221,6 +232,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
   describe('swidge (Arkade -> EVM)', () => {
     let account
+    const signerStorage = { getMnemonic: jest.fn(), setMnemonic: jest.fn() }
 
     const createResponse = {
       response: {
@@ -239,7 +251,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         getAddress: jest.fn().mockResolvedValue('ark1qsource'),
         sendTransaction: jest.fn().mockResolvedValue({ hash: '0xfundtx', fee: 100n })
       }
-      protocol = new SatoraProtocol(account, { chain: 'Arkade' })
+      protocol = new SatoraProtocol(account, { chain: 'Arkade', signerStorage })
 
       mockClient.createArkadeToEvmSwapGeneric.mockResolvedValue(createResponse)
       mockClient.claim.mockResolvedValue({ success: true, message: 'ok', txHash: '0xclaimtx' })
@@ -261,6 +273,8 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
       // The swap key is derived from the account, never from a mnemonic.
       expect(builderCalls.withXprv).toHaveBeenCalledTimes(1)
       expect(builderCalls.withXprv.mock.calls[0][0]).toMatch(/^xprv/)
+      // Signer storage (key index) is attached to the signing client only.
+      expect(builderCalls.withSignerStorage).toHaveBeenCalledWith(signerStorage)
 
       // Create with the resolved route + recipient as the target address.
       expect(mockClient.createArkadeToEvmSwapGeneric).toHaveBeenCalledWith({
