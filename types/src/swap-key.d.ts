@@ -19,3 +19,12 @@ export type IWalletAccount = import('@tetherto/wdk-wallet').IWalletAccount;
  * @throws {SatoraInvalidOptionsError} If the account exposes no usable key material.
  */
 export declare function deriveSwapXprv(account: IWalletAccount | Object): Promise<string>;
+/**
+ * Returns true if {@link deriveSwapXprv} can derive a swap key from the
+ * account, i.e. it exposes a private key or can sign. Read-only accounts
+ * cannot, and get a read-only client instead.
+ *
+ * @param {Object} account - The wallet account.
+ * @returns {boolean}
+ */
+export declare function canDeriveSwapKey(account: Object): boolean;

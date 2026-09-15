@@ -94,8 +94,8 @@ function requireEnv (name) {
 // risk funds with ephemeral in-memory storage.
 async function createStorage (dbPath) {
   try {
-    const { SqliteWalletStorage, SqliteSwapStorage } = await import('@satora/swap/node')
-    return { signerStorage: new SqliteWalletStorage(dbPath), swapStorage: new SqliteSwapStorage(dbPath) }
+    const { SqliteSwapStorage } = await import('@satora/swap/node')
+    return { swapStorage: new SqliteSwapStorage(dbPath) }
   } catch (err) {
     throw new Error(
       `persistent SQLite storage is unavailable (${err.message.split('\n')[0]}). ` +
@@ -108,13 +108,12 @@ async function createStorage (dbPath) {
 // Builds a SatoraProtocol backed by persistent storage. Pass `undefined` as the
 // account for read-only commands (status).
 async function createProtocol (account, { arkadeServerUrl, esploraUrl, dbPath }) {
-  const { signerStorage, swapStorage } = await createStorage(dbPath)
+  const { swapStorage } = await createStorage(dbPath)
   return new SatoraProtocol(account, {
     arkadeServerUrl,
     esploraUrl,
     chain: 'Arkade', // the account is an Arkade wallet (indistinguishable from a Bitcoin one)
     ...(process.env.SATORA_BASE_URL ? { baseUrl: process.env.SATORA_BASE_URL } : {}),
-    signerStorage,
     swapStorage
   })
 }

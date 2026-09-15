@@ -47,8 +47,12 @@ Bitcoin and Arkade accounts look alike, so declare `config.chain` for them.
 
 The swap client's own key material (the HTLC preimage and the claim/refund
 key) is **derived from the account** — from its key pair, or from a
-deterministic signature for external signers — so the same account always
-recovers the same swaps. You never pass a mnemonic to the protocol.
+deterministic signature for external signers — on every run and never
+persisted, so the same account always recovers the same swaps. You never pass
+a mnemonic to the protocol. The only state kept is the per-swap record in
+`swapStorage`, which also determines the next swap key index; an empty swap
+storage is seeded from the server on first use, so a new device picks up
+where the last one left off.
 
 An EVM account may also be a ready-made Satora `EvmSigner` (viem/ethers
 backed); it is used as is.
@@ -58,8 +62,7 @@ backed); it is used as is.
 ```javascript
 new SatoraProtocol(account, {
   chain,               // the account's chain: 42161 | 'Bitcoin' | 'Arkade' | 'Lightning' (detected for EVM/Lightning)
-  signerStorage,       // WalletStorage — persists the swap key index (recommended)
-  swapStorage,         // SwapStorage  — persists per-swap state (recovery/refund)
+  swapStorage,         // SwapStorage — per-swap state (keys, preimage, status) and the next key index; required to move funds
   defaultSlippage,     // decimal, e.g. 0.01 for 1%
   feeRateSatPerVb,     // on-chain fee rate for an EVM -> Bitcoin claim (default: SDK default)
   lightningMaxFeeSats, // max routing fee when a Lightning account pays the swap invoice
@@ -73,9 +76,9 @@ new SatoraProtocol(account, {
   `getSwidgeStatus`) need no account. `quoteSwidge` needs a source chain: from
   the account, `config.chain`, or a chain-qualified `fromToken`.
 - **Fund-moving** operations (`swidge`, `resumeSwidge`, `refundSwidge`) need
-  the account. Storage is **strongly recommended** and pluggable (`Sqlite*` in
-  Node, IndexedDB in the browser) so an interrupted swap survives a restart and
-  can be recovered with the same account.
+  the account and a `swapStorage` (`SqliteSwapStorage` in Node,
+  `IdbSwapStorage` in the browser, from `@satora/swap`), so an interrupted swap
+  survives a restart and can be recovered with the same account.
 
 ## Token identifiers
 
@@ -127,7 +130,7 @@ deliver less.
 import WalletManagerEvm from '@tetherto/wdk-wallet-evm'
 
 const account = await new WalletManagerEvm(seed, { provider: 'https://arb1.arbitrum.io/rpc' }).getAccount(0)
-const satora = new SatoraProtocol(account, { signerStorage, swapStorage })
+const satora = new SatoraProtocol(account, { swapStorage })
 
 const result = await satora.swidge({
   fromToken: '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', // USDT0 on the account's chain
@@ -141,7 +144,7 @@ const result = await satora.swidge({
 
 ```javascript
 // Arkade -> EVM: an Arkade wallet account (see examples/satora-cli-arkade.js)
-const satora = new SatoraProtocol(arkadeAccount, { chain: 'Arkade', signerStorage, swapStorage })
+const satora = new SatoraProtocol(arkadeAccount, { chain: 'Arkade', swapStorage })
 
 await satora.swidge({
   fromToken: 'btc',
@@ -164,7 +167,7 @@ await satora.swidge({ fromToken: '0xfd08…', toToken: 'btc', toChain: 'Lightnin
 ```javascript
 await satora.getSwidgeStatus(result.id) // -> { status, transactions }
 
-// Recover a swap interrupted after funding (same account + storage):
+// Recover a swap interrupted after funding (same account; swap storage, or an empty one seeded from the server):
 await satora.resumeSwidge(result.id)    // drive it to completion, or throw
 
 // If it can't complete, reclaim the source funds:

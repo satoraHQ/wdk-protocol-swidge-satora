@@ -63,6 +63,20 @@ export async function deriveSwapXprv (account) {
 }
 
 /**
+ * Returns true if {@link deriveSwapXprv} can derive a swap key from the
+ * account, i.e. it exposes a private key or can sign. Read-only accounts
+ * cannot, and get a read-only client instead.
+ *
+ * @param {Object} account - The wallet account.
+ * @returns {boolean}
+ */
+export function canDeriveSwapKey (account) {
+  return readPrivateKey(account) !== undefined ||
+    typeof account?.sign === 'function' ||
+    typeof account?.signTypedData === 'function'
+}
+
+/**
  * @private
  * @param {Object} account - The wallet account.
  * @returns {Promise<Uint8Array>} The raw key material.

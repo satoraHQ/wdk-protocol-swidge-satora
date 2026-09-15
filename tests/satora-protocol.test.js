@@ -16,7 +16,14 @@ const mockClient = {
   getSwap: jest.fn(),
   claim: jest.fn(),
   refundSwap: jest.fn(),
-  refundEvmWithSigner: jest.fn()
+  refundEvmWithSigner: jest.fn(),
+  recoverSwaps: jest.fn()
+}
+
+// An empty swap storage: fund-moving operations require one, since the
+// per-swap key index is derived from the stored swaps.
+function emptySwapStorage () {
+  return { list: jest.fn().mockResolvedValue([]), get: jest.fn(), store: jest.fn(), update: jest.fn(), delete: jest.fn() }
 }
 
 const builderCalls = { withXprv: jest.fn(), withSignerStorage: jest.fn() }
@@ -69,6 +76,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
   beforeEach(() => {
     for (const fn of Object.values(mockClient)) fn.mockReset()
+    mockClient.recoverSwaps.mockResolvedValue({ swaps: [] })
     builderCalls.withXprv.mockReset()
     builderCalls.withSignerStorage.mockReset()
 
@@ -142,14 +150,39 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
       expect(quote.toTokenAmount).toBe(40000n)
     })
 
-    test('the read-only client never touches signer storage (the SDK would persist a throwaway mnemonic)', async () => {
-      const signerStorage = { getMnemonic: jest.fn(), setMnemonic: jest.fn() }
-      protocol = new SatoraProtocol(evmAccount(), { signerStorage })
-
-      await protocol.quoteSwidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 10n })
+    test('without an account the client has no signer storage (nothing to derive a key from, nothing to sign)', async () => {
+      await protocol.quoteSwidge({ fromToken: 'Bitcoin:btc', toToken: '0xusdt0', toChain: 42161, fromTokenAmount: 10n })
 
       expect(builderCalls.withXprv).not.toHaveBeenCalled()
       expect(builderCalls.withSignerStorage).not.toHaveBeenCalled()
+    })
+
+    test('with an account every client uses the wallet-derived key and a key-index storage over the swap storage', async () => {
+      const swapStorage = emptySwapStorage()
+      protocol = new SatoraProtocol(evmAccount(), { swapStorage })
+
+      await protocol.quoteSwidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 10n })
+
+      expect(builderCalls.withXprv).toHaveBeenCalledTimes(1)
+      expect(builderCalls.withXprv.mock.calls[0][0]).toMatch(/^xprv/)
+      const indexStorage = builderCalls.withSignerStorage.mock.calls[0][0]
+      expect(indexStorage).not.toBe(swapStorage)
+      await expect(indexStorage.getMnemonic()).resolves.toBeNull() // the key is never persisted
+      await expect(indexStorage.getKeyIndex()).resolves.toBe(0)
+      // An empty swap storage is seeded from the server (best effort).
+      expect(mockClient.recoverSwaps).toHaveBeenCalledTimes(1)
+    })
+
+    test('a populated swap storage is not re-recovered', async () => {
+      const swapStorage = emptySwapStorage()
+      swapStorage.list.mockResolvedValue(['swap-1'])
+      swapStorage.get.mockResolvedValue({ swapId: 'swap-1', keyIndex: 4 })
+      protocol = new SatoraProtocol(evmAccount(), { swapStorage })
+
+      await protocol.quoteSwidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 10n })
+
+      expect(mockClient.recoverSwaps).not.toHaveBeenCalled()
+      await expect(builderCalls.withSignerStorage.mock.calls[0][0].getKeyIndex()).resolves.toBe(5)
     })
 
     test('derives the source chain from a WDK EVM account (eth_chainId) when config.chain is not set', async () => {
@@ -232,7 +265,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
   describe('swidge (Arkade -> EVM)', () => {
     let account
-    const signerStorage = { getMnemonic: jest.fn(), setMnemonic: jest.fn() }
+    const swapStorage = emptySwapStorage()
 
     const createResponse = {
       response: {
@@ -251,7 +284,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         getAddress: jest.fn().mockResolvedValue('ark1qsource'),
         sendTransaction: jest.fn().mockResolvedValue({ hash: '0xfundtx', fee: 100n })
       }
-      protocol = new SatoraProtocol(account, { chain: 'Arkade', signerStorage })
+      protocol = new SatoraProtocol(account, { chain: 'Arkade', swapStorage })
 
       mockClient.createArkadeToEvmSwapGeneric.mockResolvedValue(createResponse)
       mockClient.claim.mockResolvedValue({ success: true, message: 'ok', txHash: '0xclaimtx' })
@@ -273,8 +306,8 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
       // The swap key is derived from the account, never from a mnemonic.
       expect(builderCalls.withXprv).toHaveBeenCalledTimes(1)
       expect(builderCalls.withXprv.mock.calls[0][0]).toMatch(/^xprv/)
-      // Signer storage (key index) is attached to the signing client only.
-      expect(builderCalls.withSignerStorage).toHaveBeenCalledWith(signerStorage)
+      // The SDK's signer storage is the key-index adapter, never the user's own storage.
+      expect(builderCalls.withSignerStorage).toHaveBeenCalledTimes(1)
 
       // Create with the resolved route + recipient as the target address.
       expect(mockClient.createArkadeToEvmSwapGeneric).toHaveBeenCalledWith({
@@ -325,8 +358,16 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
       expect(result.toTokenAmountMin).toBe(57000000n)
     })
 
+    test('throws without a swap storage (the key index must persist)', async () => {
+      const noStorage = new SatoraProtocol(account, { chain: 'Arkade' })
+      await expect(
+        noStorage.swidge({ fromToken: 'btc', toToken: '0xusdt0', toChain: 42161, fromTokenAmount: 100000n, recipient: '0xR' })
+      ).rejects.toThrow(/swapStorage/)
+      expect(mockClient.createArkadeToEvmSwapGeneric).not.toHaveBeenCalled()
+    })
+
     test('throws if the account cannot send (read-only or missing)', async () => {
-      const readOnly = new SatoraProtocol({ getAddress: jest.fn(), keyPair: { privateKey: PRIVATE_KEY } }, { chain: 'Arkade' })
+      const readOnly = new SatoraProtocol({ getAddress: jest.fn(), keyPair: { privateKey: PRIVATE_KEY } }, { chain: 'Arkade', swapStorage })
       await expect(
         readOnly.swidge({ fromToken: 'btc', toToken: '0xusdt0', toChain: 42161, fromTokenAmount: 100000n, recipient: '0xR' })
       ).rejects.toThrow(SatoraInvalidOptionsError)
@@ -347,7 +388,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
     })
 
     test('throws if the account cannot derive the swap key', async () => {
-      const bare = new SatoraProtocol({ getAddress: jest.fn(), sendTransaction: jest.fn() }, { chain: 'Arkade' })
+      const bare = new SatoraProtocol({ getAddress: jest.fn(), sendTransaction: jest.fn() }, { chain: 'Arkade', swapStorage })
       await expect(
         bare.swidge({ fromToken: 'btc', toToken: '0xusdt0', toChain: 42161, fromTokenAmount: 100000n, recipient: '0xR' })
       ).rejects.toThrow(/swap key/)
@@ -373,7 +414,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
     beforeEach(() => {
       account = evmAccount()
-      protocol = new SatoraProtocol(account)
+      protocol = new SatoraProtocol(account, { swapStorage: emptySwapStorage() })
 
       mockClient.createEvmToArkadeSwapGeneric.mockResolvedValue({
         response: { id: 'swap-2', source_amount: '1000000', target_amount: '1450', fee_sats: 30, btc_claim_txid: null }
@@ -436,7 +477,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         waitForReceipt: jest.fn(),
         getTransaction: jest.fn()
       }
-      protocol = new SatoraProtocol(signer)
+      protocol = new SatoraProtocol(signer, { swapStorage: emptySwapStorage() })
 
       await protocol.swidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 1000000n, recipient: 'ark1qdest' })
 
@@ -448,7 +489,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
     })
 
     test('rejects a source chain that contradicts the account chain', async () => {
-      const wrong = new SatoraProtocol(account, { chain: 'Arkade' })
+      const wrong = new SatoraProtocol(account, { chain: 'Arkade', swapStorage: emptySwapStorage() })
       await expect(
         wrong.swidge({ fromToken: '42161:0xusdt0', toToken: 'Arkade:btc', fromTokenAmount: 1000000n, recipient: 'ark1qdest' })
       ).rejects.toThrow(SatoraInvalidOptionsError)
@@ -456,7 +497,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
     })
 
     test('throws if the EVM account has no provider', async () => {
-      const offline = new SatoraProtocol(evmAccount({ _provider: undefined }), { chain: 42161 })
+      const offline = new SatoraProtocol(evmAccount({ _provider: undefined }), { chain: 42161, swapStorage: emptySwapStorage() })
       await expect(
         offline.swidge({ fromToken: '0xusdt0', toToken: 'btc', toChain: 'Arkade', fromTokenAmount: 1000000n, recipient: 'ark1qdest' })
       ).rejects.toThrow(/provider/)
@@ -472,7 +513,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         keyPair: { privateKey: PRIVATE_KEY },
         payLightningInvoice: jest.fn().mockResolvedValue({ id: 'payment' })
       }
-      protocol = new SatoraProtocol(account, { lightningMaxFeeSats: 50 })
+      protocol = new SatoraProtocol(account, { lightningMaxFeeSats: 50, swapStorage: emptySwapStorage() })
 
       mockClient.createLightningToEvmSwap.mockResolvedValue({
         response: { id: 'swap-3', bolt11_invoice: 'lnbc1invoice', source_amount: '1000', target_amount: '580000', fee_sats: 10, evm_claim_txid: null }
@@ -513,7 +554,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
     test('also accepts a generic payInvoice(bolt11) account', async () => {
       const generic = { keyPair: { privateKey: PRIVATE_KEY }, payInvoice: jest.fn().mockResolvedValue({}) }
-      protocol = new SatoraProtocol(generic)
+      protocol = new SatoraProtocol(generic, { swapStorage: emptySwapStorage() })
 
       await protocol.swidge({ fromToken: 'btc', toToken: '0xusdt0', toChain: 42161, fromTokenAmount: 1000n, recipient: '0xR' })
 
@@ -536,7 +577,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
     beforeEach(() => {
       account = evmAccount()
-      protocol = new SatoraProtocol(account)
+      protocol = new SatoraProtocol(account, { swapStorage: emptySwapStorage() })
 
       mockClient.createEvmToLightningSwap.mockResolvedValue({
         response: { id: 'swap-4', source_amount: '1000000', target_amount: '900', fee_sats: 20, evm_fund_txid: null }
@@ -629,7 +670,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
         getAddress: jest.fn().mockResolvedValue('bc1qsource'),
         sendTransaction: jest.fn().mockResolvedValue({ hash: 'btcfundtx' })
       }
-      protocol = new SatoraProtocol(account, { chain: 'Bitcoin' })
+      protocol = new SatoraProtocol(account, { chain: 'Bitcoin', swapStorage: emptySwapStorage() })
 
       mockClient.createBitcoinToEvmSwap.mockResolvedValue({
         response: { id: 'swap-5', btc_htlc_address: 'bc1qhtlc', source_amount: '200000', target_amount: '116000000', fee_sats: 400 }
@@ -654,7 +695,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
     })
 
     test('EVM -> Bitcoin funds via the account and claims to the BTC address with a fee rate', async () => {
-      protocol = new SatoraProtocol(evmAccount(), { feeRateSatPerVb: 7 })
+      protocol = new SatoraProtocol(evmAccount(), { feeRateSatPerVb: 7, swapStorage: emptySwapStorage() })
 
       mockClient.createEvmToBitcoinSwap.mockResolvedValue({
         response: { id: 'swap-6', source_amount: '1000000', target_amount: '1450', fee_sats: 30 }
@@ -732,11 +773,12 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
   describe('resumeSwidge', () => {
     beforeEach(() => {
-      protocol = new SatoraProtocol({ keyPair: { privateKey: PRIVATE_KEY } })
+      protocol = new SatoraProtocol({ keyPair: { privateKey: PRIVATE_KEY } }, { swapStorage: emptySwapStorage() })
     })
 
-    test('requires an account (the swap key is derived from it)', async () => {
-      await expect(new SatoraProtocol().resumeSwidge('swap-1')).rejects.toThrow(SatoraInvalidOptionsError)
+    test('requires an account (the swap key is derived from it) and a swap storage', async () => {
+      await expect(new SatoraProtocol(undefined, { swapStorage: emptySwapStorage() }).resumeSwidge('swap-1')).rejects.toThrow(SatoraInvalidOptionsError)
+      await expect(new SatoraProtocol({ keyPair: { privateKey: PRIVATE_KEY } }).resumeSwidge('swap-1')).rejects.toThrow(/swapStorage/)
     })
 
     test('returns immediately when the swap is already settled', async () => {
@@ -779,7 +821,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
 
     beforeEach(() => {
       account = { keyPair: { privateKey: PRIVATE_KEY }, getAddress: jest.fn().mockResolvedValue('ark1qsource') }
-      protocol = new SatoraProtocol(account, { chain: 'Arkade' })
+      protocol = new SatoraProtocol(account, { chain: 'Arkade', swapStorage: emptySwapStorage() })
     })
 
     test('throws if no account is bound (needed to receive the refund)', async () => {
@@ -817,7 +859,7 @@ describe('@satora/wdk-protocol-swidge-satora', () => {
     })
 
     test('EVM-sourced swap refunds via the timelock refund, sent by the account', async () => {
-      protocol = new SatoraProtocol(evmAccount())
+      protocol = new SatoraProtocol(evmAccount(), { swapStorage: emptySwapStorage() })
       mockClient.getSwap.mockResolvedValue({ status: 'expired', direction: 'evm_to_bitcoin', evm_chain_id: 42161 })
       mockClient.refundEvmWithSigner.mockResolvedValue({ txHash: '0xrefundtx' })
 
