@@ -40,7 +40,7 @@
     "@scure/bip39": "^2.4.0",
     "@tetherto/wdk-wallet-btc": "^1.0.0-beta.15",
     "@tetherto/wdk-wallet-evm": "^1.0.0-beta.18",
-    "@tetherto/wdk-wallet-spark": "^1.0.0-beta.25",
+    "@tetherto/wdk-wallet-spark": "^1.0.0-beta.26",
     "cross-env": "^10.1.0",
     "eventsource": "^5.1.1",
     "jest": "^30.5.1",
