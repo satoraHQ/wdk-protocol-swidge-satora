@@ -30,20 +30,20 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.4.0",
-    "@satora/swap": "^1.4.0",
+    "@satora/swap": "^1.5.0",
     "@scure/bip32": "^2.4.0",
     "@tetherto/wdk-wallet": "^1.0.0-beta.19",
-    "bare-node-runtime": "^1.5.0"
+    "bare-node-runtime": "^1.5.1"
   },
   "devDependencies": {
-    "@arkade-os/sdk": "^0.4.72",
+    "@arkade-os/sdk": "^0.4.76",
     "@scure/bip39": "^2.4.0",
     "@tetherto/wdk-wallet-btc": "^1.0.0-beta.15",
     "@tetherto/wdk-wallet-evm": "^1.0.0-beta.18",
     "@tetherto/wdk-wallet-spark": "^1.0.0-beta.25",
     "cross-env": "^10.1.0",
-    "eventsource": "^5.1.1",
-    "jest": "^30.5.1",
+    "eventsource": "^5.1.2",
+    "jest": "^30.5.2",
     "standard": "^17.1.2",
     "typescript": "^7.0.2"
   },
